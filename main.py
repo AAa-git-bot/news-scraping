@@ -40,7 +40,7 @@ def is_already_collected(url: str) -> bool:
     docs = db.collection("news-summary").where("url", "==", url).limit(1).stream()
     return any(docs)
 
-def summarize_with_gemini(title: str, text: str, is_weekly_report: bool = False) -> dict:
+def summarize_with_gemini(title: str, text: str, is_weekly_report: bool = False) -> str:
     """Gemini API를 이용해 핵심 요약 3줄과 한 줄 인사이트를 생성합니다."""
     if is_weekly_report:
         prompt = f"""
@@ -156,20 +156,22 @@ def fetch_semi_engineering():
 # 4. 부가 기능 (7일 이상 지난 기사 삭제 & 주간 보고서 생성)
 # ==========================================
 def cleanup_old_articles():
-    """북마크 처리되지 않은 7일 이전 기사들을 삭제합니다."""
+    """북마크 처리되지 않은 7일 이전 기사들을 삭제합니다 (인덱스 에러 방지 버전)."""
     print("🧹 오래된 기사 정리를 시작합니다 (7일 경과 & 북마크 안 됨)...")
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     
-    # 7일 이전 + 북마크되지 않은 문서 조회
+    # 단일 필드 조건(created_at)만 사용하여 인덱스 오류 방지
     docs = db.collection("news-summary") \
-             .where("is_bookmarked", "==", False) \
              .where("created_at", "<", seven_days_ago) \
              .stream()
     
     count = 0
     for doc in docs:
-        doc.reference.delete()
-        count += 1
+        data = doc.to_dict()
+        # 파이썬 코드 레벨에서 북마크가 안 된(False) 문서만 걸러내어 삭제
+        if not data.get("is_bookmarked", False):
+            doc.reference.delete()
+            count += 1
     print(f"🧹 총 {count}개의 오래된 기사가 삭제되었습니다.")
 
 def generate_weekly_report():
