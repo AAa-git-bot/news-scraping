@@ -916,8 +916,8 @@ def collect_naver_category(
                 print(
                     f"   📌 카테고리별 최대 "
                     f"{MAX_ARTICLES_PER_CATEGORY}개 "
-                    f저장 완료"
-                )
+                    "저장 완료"
+                    )
                 break
 
         print()
