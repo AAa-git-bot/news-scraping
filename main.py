@@ -21,7 +21,7 @@ from google import genai
 KST = timezone(timedelta(hours=9))
 
 # 사용자가 요청한 Gemini 모델
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 # 카테고리별 최대 수집 기사 수
 MAX_ARTICLES_PER_CATEGORY = 5
