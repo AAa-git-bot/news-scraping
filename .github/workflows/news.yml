@@ -2,10 +2,11 @@ name: News Collector
 
 on:
   schedule:
-    # UTC 21:00 = 한국시간(KST) 다음날 오전 6:00
+    # 매일 오전 6시 KST
+    # GitHub Actions cron은 UTC 기준
+    # 21:00 UTC = 다음날 06:00 KST
     - cron: "0 21 * * *"
 
-  # GitHub Actions 화면에서 수동 실행 가능
   workflow_dispatch:
 
 jobs:
@@ -14,7 +15,7 @@ jobs:
 
     steps:
       # ------------------------------------------------------
-      # Repository checkout
+      # Repository
       # ------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,22 +38,63 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------------
-      # News collector
+      # News Collector
       # ------------------------------------------------------
       - name: 뉴스 수집 및 요약
         env:
           # Gemini
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-3.8-flash
 
           # Firebase
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
 
-          # Naver Search API
+          # Naver News API
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
 
-          # Python log buffering 방지
+          # --------------------------------------------------
+          # Gemini 설정
+          # --------------------------------------------------
+          GEMINI_MODEL: gemini-3.8-flash
+
+          # 한 번 실행에서 Gemini API 최대 15회
+          #
+          # 20회 무료 quota 환경을 고려하여
+          # 5회 정도 여유를 둔다.
+          #
+          # 503 재시도도 이 숫자에 포함된다.
+          MAX_GEMINI_CALLS_PER_RUN: "15"
+
+          # --------------------------------------------------
+          # 기사 처리 제한
+          # --------------------------------------------------
+          #
+          # 카테고리당 최종 저장 최대 5개
+          MAX_ARTICLES_PER_CATEGORY: "5"
+
+          #
+          # 중요:
+          # "성공적으로 5개 저장될 때까지" 146개를
+          # 계속 뒤지는 것이 아니라,
+          # 신규 기사 최대 5개까지만 Gemini 처리한다.
+          MAX_NEW_ARTICLES_PER_CATEGORY: "5"
+
+          # 본문 최소 길이
+          MIN_ARTICLE_LENGTH: "200"
+
+          # 7일 지난 미북마크 기사 삭제
+          DELETE_AFTER_DAYS: "7"
+
+          # HTTP timeout
+          HTTP_TIMEOUT: "20"
+
+          # Gemini 503 재시도 횟수
+          #
+          # 초기 요청 + 최대 2회 재시도
+          # = 최대 3번 시도
+          MAX_GEMINI_503_RETRIES: "2"
+
+          # 로그를 바로 출력
           PYTHONUNBUFFERED: "1"
 
         run: |
