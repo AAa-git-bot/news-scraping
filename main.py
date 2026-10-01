@@ -1,15 +1,15 @@
 import os
 import re
-import json
-import html
+import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from google import genai
 
@@ -20,22 +20,11 @@ from google import genai
 
 KST = timezone(timedelta(hours=9))
 
-# 사용자가 요청한 Gemini 모델
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-# 카테고리별 최대 수집 기사 수
 MAX_ARTICLES_PER_CATEGORY = 5
-
-# 기사 본문 최소 길이
 MIN_ARTICLE_LENGTH = 200
-
-# 기사 오래된 데이터 삭제 기준
 DELETE_AFTER_DAYS = 7
-
-
-# ============================================================
-# 수집 대상
-# ============================================================
 
 NAVER_ISSUES = [
     {
@@ -65,32 +54,12 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
 }
+
 
 session = requests.Session()
 session.headers.update(HEADERS)
-
-
-# ============================================================
-# 환경변수 확인
-# ============================================================
-
-def require_env(name):
-    value = os.getenv(name)
-
-    if not value:
-        raise RuntimeError(
-            f"환경변수 {name} 이(가) 없습니다. "
-            f"GitHub Secrets를 확인하세요."
-        )
-
-    return value
 
 
 # ============================================================
@@ -98,23 +67,37 @@ def require_env(name):
 # ============================================================
 
 def init_firestore():
-    if firebase_admin._apps:
-        return firestore.client()
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 
-    service_account_json = require_env("FIREBASE_SERVICE_ACCOUNT")
-
-    try:
-        service_account_info = json.loads(service_account_json)
-    except json.JSONDecodeError as e:
+    if not service_account_json:
         raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT가 올바른 JSON이 아닙니다."
-        ) from e
+            "FIREBASE_SERVICE_ACCOUNT 환경변수가 없습니다."
+        )
 
-    cred = credentials.Certificate(service_account_info)
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(
+            eval_service_account_json(service_account_json)
+        )
 
-    firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(cred)
 
     return firestore.client()
+
+
+def eval_service_account_json(value):
+    """
+    GitHub Secret에 저장된 Firebase Service Account JSON을
+    안전하게 JSON으로 파싱한다.
+    """
+
+    import json
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "FIREBASE_SERVICE_ACCOUNT가 올바른 JSON 형식이 아닙니다."
+        ) from e
 
 
 db = init_firestore()
@@ -124,20 +107,29 @@ db = init_firestore()
 # Gemini 초기화
 # ============================================================
 
-gemini_api_key = require_env("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY 환경변수가 없습니다."
+    )
 
 gemini_client = genai.Client(
-    api_key=gemini_api_key
+    api_key=GEMINI_API_KEY
 )
 
 
 # ============================================================
-# URL 정리
+# 공통 함수
 # ============================================================
+
+def now_kst():
+    return datetime.now(KST)
+
 
 def clean_url(url):
     """
-    실수로 Markdown 링크가 들어와도 실제 URL만 추출한다.
+    Markdown 링크 형태가 들어와도 실제 URL만 추출한다.
 
     예:
     [https://example.com](https://example.com)
@@ -148,110 +140,77 @@ def clean_url(url):
     if not url:
         return ""
 
-    url = html.unescape(url).strip()
+    url = url.strip()
 
-    # Markdown 링크:
-    # [텍스트](URL)
-    match = re.match(r"^\[.*?\]\((https?://[^)]+)\)$", url)
-
-    if match:
-        url = match.group(1)
-
-    # 혹시 앞뒤에 따옴표가 있으면 제거
-    url = url.strip('"').strip("'")
-
-    # //example.com
-    if url.startswith("//"):
-        url = "https:" + url
-
-    # Naver 모바일 URL 통일
-    url = url.replace(
-        "https://m.news.naver.com/",
-        "https://n.news.naver.com/"
+    markdown_match = re.match(
+        r"^\[.*?\]\((https?://[^)]+)\)$",
+        url
     )
 
-    # URL fragment 제거
-    try:
-        parsed = urlparse(url)
+    if markdown_match:
+        url = markdown_match.group(1)
 
-        parsed = parsed._replace(fragment="")
+    # 혹시 문자열 중간에 Markdown URL이 들어온 경우
+    if "](" in url and url.endswith(")"):
+        match = re.search(
+            r"\((https?://[^)]+)\)$",
+            url
+        )
 
-        url = urlunparse(parsed)
+        if match:
+            url = match.group(1)
 
-    except Exception:
-        pass
+    # Naver 모바일 URL 정규화
+    url = url.replace(
+        "https://m.news.naver.com",
+        "https://n.news.naver.com"
+    )
 
     return url
 
 
-# ============================================================
-# HTTP 요청
-# ============================================================
+def fetch_page(url, timeout=30):
+    """
+    웹 페이지 요청.
+    """
 
-def fetch_page(url, timeout=20):
     url = clean_url(url)
 
-    print(f"🌐 요청: {url}")
+    print(f"   🌐 요청: {url}")
 
-    try:
-        response = session.get(
-            url,
-            timeout=timeout,
-            allow_redirects=True,
-        )
+    response = session.get(
+        url,
+        timeout=timeout,
+        allow_redirects=True,
+    )
 
-        print(
-            f"   HTTP {response.status_code} "
-            f"| 최종 URL: {response.url} "
-            f"| HTML: {len(response.text):,} bytes"
-        )
+    print(
+        f"   HTTP {response.status_code} | "
+        f"최종 URL: {response.url} | "
+        f"HTML: {len(response.text):,} bytes"
+    )
 
-        response.raise_for_status()
+    response.raise_for_status()
 
-        response.encoding = response.apparent_encoding or response.encoding
-
-        return response
-
-    except requests.RequestException as e:
-        print(f"❌ 요청 실패: {url}")
-        print(f"   오류: {e}")
-
-        return None
+    return response.text, response.url
 
 
 # ============================================================
-# Firestore 기존 URL 확인
-# ============================================================
-
-def is_already_collected(url):
-    url = clean_url(url)
-
-    try:
-        docs = (
-            db.collection("news-summary")
-            .where("url", "==", url)
-            .limit(1)
-            .stream()
-        )
-
-        for _ in docs:
-            return True
-
-        return False
-
-    except Exception as e:
-        print(f"⚠️ Firestore 중복 확인 실패: {e}")
-
-        # 중복 확인이 안 되는 상황에서 같은 기사를
-        # 여러 번 저장하는 것보다 안전하게 건너뛴다.
-        return True
-
-
-# ============================================================
-# Naver 기사 URL 판별
+# Naver URL 필터
 # ============================================================
 
 def is_naver_article_url(url):
+    """
+    실제 네이버 뉴스 기사 URL만 허용한다.
+
+    허용:
+      /article/092/000...
+      /mnews/article/...
+
+    제외:
+      /article/comment/...
+    """
+
     if not url:
         return False
 
@@ -265,15 +224,46 @@ def is_naver_article_url(url):
     }:
         return False
 
-    article_patterns = [
-        "/article/",
-        "/mnews/article/",
-    ]
+    # 댓글 URL은 반드시 제외
+    if "/article/comment/" in parsed.path:
+        return False
 
-    return any(
-        pattern in parsed.path
-        for pattern in article_patterns
+    # 실제 기사 URL
+    if "/article/" in parsed.path:
+        return True
+
+    if "/mnews/article/" in parsed.path:
+        return True
+
+    return False
+
+
+# ============================================================
+# Firestore 중복 확인
+# ============================================================
+
+def is_already_collected(url):
+    """
+    URL이 이미 news-summary 컬렉션에 있는지 확인한다.
+    """
+
+    url = clean_url(url)
+
+    query = (
+        db.collection("news-summary")
+        .where(
+            filter=FieldFilter(
+                "url",
+                "==",
+                url,
+            )
+        )
+        .limit(1)
     )
+
+    docs = list(query.stream())
+
+    return len(docs) > 0
 
 
 # ============================================================
@@ -281,81 +271,109 @@ def is_naver_article_url(url):
 # ============================================================
 
 def extract_naver_issue_links(issue_url):
-    print(f"\n🔎 네이버 이슈 페이지 분석")
-    print(f"   URL: {issue_url}")
+    print()
+    print("🔎 네이버 이슈 페이지 분석")
 
-    response = fetch_page(issue_url)
+    html, final_url = fetch_page(issue_url)
 
-    if response is None:
-        return []
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
 
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    urls = []
-    seen = set()
+    found_urls = []
 
     # --------------------------------------------------------
-    # 1차: a[href]
+    # HTML <a> 태그 분석
     # --------------------------------------------------------
 
-    for a in soup.select("a[href]"):
+    for a in soup.find_all("a", href=True):
+
         href = a.get("href", "").strip()
 
         if not href:
             continue
 
-        absolute_url = urljoin(response.url, href)
+        href = clean_url(
+            urljoin(final_url, href)
+        )
 
-        absolute_url = clean_url(absolute_url)
+        if is_naver_article_url(href):
+            found_urls.append(href)
 
-        if not is_naver_article_url(absolute_url):
+    # --------------------------------------------------------
+    # Raw HTML에서 URL 패턴 추가 탐색
+    # --------------------------------------------------------
+
+    raw_urls = re.findall(
+        r'https?://(?:n\.news\.naver\.com|news\.naver\.com)'
+        r'/[^"\'>\s]+',
+        html,
+    )
+
+    for url in raw_urls:
+
+        url = clean_url(url)
+
+        if is_naver_article_url(url):
+            found_urls.append(url)
+
+    # --------------------------------------------------------
+    # 중복 제거
+    # --------------------------------------------------------
+
+    unique_urls = []
+
+    seen = set()
+
+    for url in found_urls:
+
+        url = clean_url(url)
+
+        if not is_naver_article_url(url):
             continue
 
-        if absolute_url not in seen:
-            seen.add(absolute_url)
-            urls.append(absolute_url)
+        # query parameter에서 iid 등은 유지하되
+        # 동일 기사 URL은 중복 제거
+        parsed = urlparse(url)
 
-    # --------------------------------------------------------
-    # 2차: HTML 안에 직접 들어있는 Naver article URL 검색
-    # --------------------------------------------------------
+        normalized = urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                "",
+                parsed.query,
+                "",
+            )
+        )
 
-    patterns = [
-        r'https?://n\.news\.naver\.com/article/\d+/\d+',
-        r'https?://n\.news\.naver\.com/mnews/article/\d+/\d+',
-        r'https?://news\.naver\.com/article/\d+/\d+',
-        r'https?://news\.naver\.com/mnews/article/\d+/\d+',
-    ]
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_urls.append(normalized)
 
-    for pattern in patterns:
-        matches = re.findall(pattern, response.text)
+    print(
+        f"   ✅ 발견한 Naver 기사 URL: "
+        f"{len(unique_urls)}개"
+    )
 
-        for match in matches:
-            match = clean_url(match)
-
-            if match not in seen:
-                seen.add(match)
-                urls.append(match)
-
-    print(f"   ✅ 발견한 Naver 기사 URL: {len(urls)}개")
-
-    for i, url in enumerate(urls[:10], start=1):
+    for i, url in enumerate(
+        unique_urls[:10],
+        start=1
+    ):
         print(f"      {i}. {url}")
 
-    return urls
+    return unique_urls
 
 
 # ============================================================
 # Naver Search API fallback
 # ============================================================
 
-def search_naver_news_api(query, display=30):
+def search_naver_news_api(query, display=20):
     """
-    이슈 페이지에서 기사 URL을 하나도 찾지 못했을 때
-    선택적으로 Naver Search API를 사용한다.
-
-    NAVER_CLIENT_ID
-    NAVER_CLIENT_SECRET
-    이 두 Secret이 없으면 그냥 [] 반환.
+    Naver 뉴스 검색 API fallback.
+    이슈 페이지에서 URL을 충분히 가져오지 못하는 경우 사용한다.
     """
 
     client_id = os.getenv("NAVER_CLIENT_ID")
@@ -363,75 +381,51 @@ def search_naver_news_api(query, display=30):
 
     if not client_id or not client_secret:
         print(
-            "   ℹ️ Naver Search API Secret이 없어 "
-            "API fallback을 건너뜁니다."
+            "   ⚠️ NAVER_CLIENT_ID / "
+            "NAVER_CLIENT_SECRET이 없어 API 검색을 건너뜁니다."
         )
         return []
 
-    print(f"   🔁 Naver Search API fallback: {query}")
+    print(
+        f"   🔎 Naver Search API 검색: {query}"
+    )
 
-    url = "https://openapi.naver.com/v1/search/news.json"
+    api_url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
         "X-Naver-Client-Id": client_id,
         "X-Naver-Client-Secret": client_secret,
-        "User-Agent": HEADERS["User-Agent"],
     }
 
     params = {
         "query": query,
         "display": display,
-        "start": 1,
         "sort": "date",
     }
 
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
+    response = session.get(
+        api_url,
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
 
-        print(
-            f"   Search API HTTP {response.status_code}"
-        )
+    response.raise_for_status()
 
-        response.raise_for_status()
-
-        data = response.json()
-
-    except Exception as e:
-        print(f"❌ Naver Search API 실패: {e}")
-        return []
+    data = response.json()
 
     results = []
 
     for item in data.get("items", []):
-        title = BeautifulSoup(
-            item.get("title", ""),
-            "html.parser"
-        ).get_text(" ", strip=True)
 
-        article_url = (
+        link = clean_url(
             item.get("originallink")
             or item.get("link")
             or ""
         )
 
-        article_url = clean_url(article_url)
-
-        if not article_url:
-            continue
-
-        results.append(
-            {
-                "url": article_url,
-                "title": title,
-            }
-        )
-
-    print(f"   ✅ Search API 결과: {len(results)}개")
+        if is_naver_article_url(link):
+            results.append(link)
 
     return results
 
@@ -440,18 +434,17 @@ def search_naver_news_api(query, display=30):
 # Naver 기사 본문 추출
 # ============================================================
 
-def extract_article(url, fallback_title=""):
-    url = clean_url(url)
-
-    print(f"\n📄 기사 본문 추출")
+def extract_article(url):
+    print()
+    print("📄 기사 본문 추출")
     print(f"   URL: {url}")
 
-    response = fetch_page(url)
+    html, final_url = fetch_page(url)
 
-    if response is None:
-        return None
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
 
     # --------------------------------------------------------
     # 제목
@@ -462,261 +455,275 @@ def extract_article(url, fallback_title=""):
     title_selectors = [
         "h2#title_area",
         "h2.media_end_head_headline",
+        "h1#title_area",
         "h1",
-        "meta[property='og:title']",
-        "title",
     ]
 
     for selector in title_selectors:
+
         element = soup.select_one(selector)
 
-        if not element:
-            continue
+        if element:
+            title = element.get_text(
+                " ",
+                strip=True
+            )
 
-        if element.name == "meta":
-            value = element.get("content", "")
-        else:
-            value = element.get_text(" ", strip=True)
-
-        if value:
-            title = value.strip()
-            break
-
-    if not title:
-        title = fallback_title or "제목 없음"
+            if title:
+                break
 
     # --------------------------------------------------------
     # 본문
     # --------------------------------------------------------
 
+    body = ""
+
     body_selectors = [
-        "div#dic_area",
-        "div#newsct_article",
         "article#dic_area",
-        "div.newsct_article",
+        "div#dic_area",
+        "div._article_content",
         "div.article_body",
         "article",
     ]
 
-    body = None
-
     for selector in body_selectors:
+
         element = soup.select_one(selector)
 
-        if element:
-            body = element
-            break
+        if not element:
+            continue
 
-    # --------------------------------------------------------
-    # 본문 제거 요소
-    # --------------------------------------------------------
+        # 불필요한 요소 제거
+        for tag in element.select(
+            "script, style, iframe, figure, "
+            "button, aside, nav"
+        ):
+            tag.decompose()
 
-    if body:
-        remove_selectors = [
-            "script",
-            "style",
-            "iframe",
-            "figure",
-            "button",
-            "aside",
-            ".byline",
-            ".copyright",
-            ".reporter",
-            ".media_end_head_journalist",
-            ".media_end_head_info_datestamp",
-        ]
-
-        for selector in remove_selectors:
-            for element in body.select(selector):
-                element.decompose()
-
-        text = body.get_text(
+        text = element.get_text(
             "\n",
             strip=True
         )
 
-    else:
-        text = ""
+        if len(text) > len(body):
+            body = text
 
     # --------------------------------------------------------
-    # 본문이 너무 짧으면 OG description 사용
+    # 불필요한 공백 정리
     # --------------------------------------------------------
 
-    if len(text) < 100:
-        description = soup.select_one(
-            "meta[property='og:description']"
-        )
-
-        if description:
-            text = description.get("content", "").strip()
-
-    # --------------------------------------------------------
-    # 공백 정리
-    # --------------------------------------------------------
-
-    text = re.sub(
+    body = re.sub(
         r"\n{3,}",
         "\n\n",
-        text
+        body
     )
 
-    text = re.sub(
-        r"[ \t]+",
+    body = re.sub(
+        r"[ \t]{2,}",
         " ",
-        text
-    ).strip()
+        body
+    )
 
     print(f"   제목: {title}")
-    print(f"   본문 길이: {len(text):,}자")
+    print(f"   본문 길이: {len(body):,}자")
 
-    if len(text) < MIN_ARTICLE_LENGTH:
-        print(
-            f"   ⚠️ 본문이 너무 짧아 건너뜁니다."
+    if not title:
+        raise RuntimeError(
+            "기사 제목을 찾지 못했습니다."
         )
-        return None
 
-    return {
-        "title": title,
-        "url": url,
-        "text": text,
-    }
+    if len(body) < MIN_ARTICLE_LENGTH:
+        raise RuntimeError(
+            f"기사 본문이 너무 짧습니다. "
+            f"현재 {len(body)}자"
+        )
+
+    return title, body
 
 
 # ============================================================
-# SemiEngineering 기사 목록 추출
+# SemiEngineering 링크 추출
 # ============================================================
 
 def extract_semiengineering_links():
-    print("\n" + "=" * 60)
+    print()
     print("📰 SemiEngineering 수집 시작")
+    print()
     print("=" * 60)
 
-    response = fetch_page(SEMIENGINEERING_AUTHOR_URL)
-
-    if response is None:
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    candidates = []
-    seen = set()
-
-    # --------------------------------------------------------
-    # 모든 링크 중 "Chip Industry Week In Review" 포함 링크
-    # --------------------------------------------------------
-
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-
-        if not href:
-            continue
-
-        title = a.get_text(" ", strip=True)
-
-        absolute_url = urljoin(
-            response.url,
-            href
-        )
-
-        absolute_url = clean_url(absolute_url)
-
-        combined = f"{title} {absolute_url}".lower()
-
-        if "chip industry week in review" not in combined:
-            continue
-
-        if absolute_url in seen:
-            continue
-
-        # author 페이지 자체는 제외
-        if absolute_url.rstrip("/") == SEMIENGINEERING_AUTHOR_URL.rstrip("/"):
-            continue
-
-        seen.add(absolute_url)
-
-        candidates.append(
-            {
-                "url": absolute_url,
-                "title": title,
-            }
-        )
-
-    print(
-        f"   ✅ 'Chip Industry Week In Review' 후보: "
-        f"{len(candidates)}개"
+    html, final_url = fetch_page(
+        SEMIENGINEERING_AUTHOR_URL
     )
 
-    for i, item in enumerate(candidates[:10], start=1):
-        print(
-            f"      {i}. {item['title']}\n"
-            f"         {item['url']}"
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
+
+    results = []
+
+    for a in soup.find_all("a", href=True):
+
+        title = a.get_text(
+            " ",
+            strip=True
         )
 
-    return candidates
+        href = clean_url(
+            urljoin(
+                final_url,
+                a.get("href")
+            )
+        )
+
+        if (
+            "Chip Industry Week In Review"
+            in title
+        ):
+            results.append(
+                {
+                    "title": title,
+                    "url": href,
+                }
+            )
+
+    # 중복 제거
+    unique = []
+
+    seen = set()
+
+    for item in results:
+
+        url = item["url"]
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+        unique.append(item)
+
+    print(
+        f"   ✅ 'Chip Industry Week In Review' "
+        f"후보: {len(unique)}개"
+    )
+
+    for i, item in enumerate(
+        unique[:10],
+        start=1
+    ):
+        print(f"      {i}. {item['title']}")
+        print(f"         {item['url']}")
+
+    return unique
 
 
 # ============================================================
 # Gemini 요약
 # ============================================================
 
-def summarize_with_gemini(title, text):
-    print("🤖 Gemini 요약 시작")
-
-    # 너무 긴 기사는 일정 길이까지만 전송
-    article_text = text[:12000]
+def summarize_with_gemini(title, body):
+    """
+    Gemini 503 / 일시적 서버 오류 발생 시
+    최대 3회 재시도한다.
+    """
 
     prompt = f"""
-다음 뉴스 기사를 한국어로 요약해 주세요.
+다음 뉴스 기사를 한국어로 요약해줘.
 
-[기사 제목]
+제목:
 {title}
 
-[기사 본문]
-{article_text}
+본문:
+{body}
 
-반드시 아래 형식을 정확하게 지켜주세요.
+다음 형식을 정확히 지켜줘.
 
 [요약 1]
-한 문장
+핵심 내용을 한 문장으로 작성
 
 [요약 2]
-한 문장
+중요한 내용을 한 문장으로 작성
 
 [요약 3]
-한 문장
+향후 영향이나 의미를 한 문장으로 작성
 
 [인사이트]
-이 기사가 반도체/AI/기술 산업에 주는 의미를 한 문장으로 작성
-
-규칙:
-1. 반드시 한국어로 작성합니다.
-2. 요약은 기사에 실제로 나온 내용만 사용합니다.
-3. 기사에 없는 숫자, 사실, 전망을 임의로 만들지 않습니다.
-4. 각 요약은 핵심 내용 위주로 간결하게 작성합니다.
-5. 인사이트는 단순한 기사 반복이 아니라 산업적 의미를 설명합니다.
-6. 제목이나 서론을 추가하지 않습니다.
+이 뉴스가 반도체/AI 산업에 어떤 의미가 있는지 한 문장으로 작성
 """
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
+    max_retries = 3
 
-        result = (response.text or "").strip()
+    for attempt in range(
+        1,
+        max_retries + 1
+    ):
 
-        if not result:
-            raise RuntimeError(
-                "Gemini 응답이 비어 있습니다."
+        try:
+
+            print(
+                f"   🤖 Gemini 요약 시도 "
+                f"{attempt}/{max_retries}"
             )
 
-        print("   ✅ Gemini 요약 완료")
+            response = (
+                gemini_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                )
+            )
 
-        return result
+            if not response.text:
+                raise RuntimeError(
+                    "Gemini 응답이 비어 있습니다."
+                )
 
-    except Exception as e:
-        print(f"❌ Gemini 요약 실패: {e}")
-        raise
+            print("   ✅ Gemini 요약 완료")
+
+            return response.text.strip()
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            print(
+                f"   ⚠️ Gemini 오류 "
+                f"({attempt}/{max_retries}): "
+                f"{error_text}"
+            )
+
+            # ------------------------------------------------
+            # 503 / UNAVAILABLE은 일시적 오류로 보고 재시도
+            # ------------------------------------------------
+
+            if (
+                "503" in error_text
+                or "UNAVAILABLE" in error_text
+            ):
+
+                if attempt < max_retries:
+
+                    wait_seconds = attempt * 10
+
+                    print(
+                        f"   ⏳ Gemini 서버가 바쁩니다. "
+                        f"{wait_seconds}초 후 재시도합니다."
+                    )
+
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                    continue
+
+            # ------------------------------------------------
+            # 다른 오류 또는 재시도 횟수 초과
+            # ------------------------------------------------
+
+            raise
+
+    raise RuntimeError(
+        "Gemini 요약에 실패했습니다."
+    )
 
 
 # ============================================================
@@ -724,26 +731,35 @@ def summarize_with_gemini(title, text):
 # ============================================================
 
 def save_article(
-    article,
-    summary,
     category,
-    source,
+    title,
+    url,
+    summary,
 ):
+    """
+    news-summary 컬렉션에 저장한다.
+    """
+
+    url = clean_url(url)
+
+    doc_ref = db.collection(
+        "news-summary"
+    ).document()
+
     data = {
-        "title": article["title"],
-        "url": article["url"],
-        "summary": summary,
         "category": category,
-        "source": source,
-        "is_bookmarked": False,
-        "created_at": firestore.SERVER_TIMESTAMP,
+        "title": title,
+        "url": url,
+        "summary": summary,
+        "bookmarked": False,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "collectedAt": firestore.SERVER_TIMESTAMP,
     }
 
-    db.collection("news-summary").add(data)
+    doc_ref.set(data)
 
     print(
-        f"   💾 Firestore 저장 완료: "
-        f"{article['title']}"
+        f"   💾 Firestore 저장 완료: {title}"
     )
 
 
@@ -752,138 +768,180 @@ def save_article(
 # ============================================================
 
 def collect_naver_category(
-    issue,
+    category_name,
+    issue_url,
+    search_query,
 ):
-    category_name = issue["name"]
-    issue_url = issue["url"]
-    fallback_query = issue["query"]
-
-    print("\n" + "=" * 60)
-    print(f"🔥 [{category_name}] 네이버 뉴스 수집 시작")
-    print(f"   URL: {issue_url}")
+    print()
+    print("=" * 60)
+    print(
+        f"🔥 [{category_name}] "
+        f"네이버 뉴스 수집 시작"
+    )
+    print(
+        f"   URL: {issue_url}"
+    )
     print("=" * 60)
 
-    article_urls = extract_naver_issue_links(
-        issue_url
-    )
+    try:
 
-    search_results = []
-
-    # --------------------------------------------------------
-    # 이슈 페이지에서 0개면 Search API fallback
-    # --------------------------------------------------------
-
-    if not article_urls:
-        print(
-            "⚠️ 이슈 페이지에서 기사 URL을 찾지 못했습니다."
+        article_urls = extract_naver_issue_links(
+            issue_url
         )
 
-        search_results = search_naver_news_api(
-            fallback_query,
-            display=30,
-        )
+        # ----------------------------------------------------
+        # URL이 충분하지 않으면 Search API fallback
+        # ----------------------------------------------------
 
-        article_urls = [
-            item["url"]
-            for item in search_results
-        ]
+        if len(article_urls) == 0:
 
-    if not article_urls:
-        print(
-            f"❌ [{category_name}] 수집할 기사 URL이 없습니다."
-        )
-        return 0
+            print(
+                "   ⚠️ 이슈 페이지에서 기사 URL을 찾지 못했습니다."
+            )
 
-    # 중복 제거
-    unique_urls = []
+            api_urls = search_naver_news_api(
+                search_query
+            )
 
-    for url in article_urls:
-        url = clean_url(url)
+            article_urls.extend(
+                api_urls
+            )
 
-        if url and url not in unique_urls:
+        # ----------------------------------------------------
+        # 중복 제거
+        # ----------------------------------------------------
+
+        unique_urls = []
+
+        seen = set()
+
+        for url in article_urls:
+
+            url = clean_url(url)
+
+            if not is_naver_article_url(url):
+                continue
+
+            if url in seen:
+                continue
+
+            seen.add(url)
+
             unique_urls.append(url)
 
-    print(
-        f"📌 최종 처리 대상 URL: "
-        f"{len(unique_urls)}개"
-    )
+        article_urls = unique_urls
 
-    saved_count = 0
-
-    for index, url in enumerate(
-        unique_urls,
-        start=1,
-    ):
-        if saved_count >= MAX_ARTICLES_PER_CATEGORY:
-            break
-
+        print()
         print(
-            f"\n--- [{category_name}] "
-            f"{index}/{len(unique_urls)} ---"
+            f"   📌 최종 처리 대상 URL: "
+            f"{len(article_urls)}개"
         )
 
-        # ----------------------------------------------------
-        # Firestore 중복 확인
-        # ----------------------------------------------------
-
-        if is_already_collected(url):
-            print("⏭️ 이미 Firestore에 존재 → 건너뜀")
-            continue
+        saved_count = 0
 
         # ----------------------------------------------------
-        # Search API에서 제목 가져오기
+        # 기사 처리
         # ----------------------------------------------------
 
-        fallback_title = ""
+        for index, url in enumerate(
+            article_urls,
+            start=1
+        ):
 
-        for item in search_results:
-            if clean_url(item["url"]) == url:
-                fallback_title = item.get(
-                    "title",
-                    ""
+            print()
+            print(
+                f"--- [{category_name}] "
+                f"{index}/{len(article_urls)} ---"
+            )
+
+            # 이미 저장된 기사인지 확인
+            try:
+
+                if is_already_collected(url):
+
+                    print(
+                        "   ⏭️ 이미 수집된 기사 → 스킵"
+                    )
+
+                    continue
+
+            except Exception as e:
+
+                print(
+                    f"   ⚠️ Firestore 중복 확인 실패: {e}"
+                )
+
+                continue
+
+            try:
+
+                title, body = extract_article(
+                    url
+                )
+
+                print()
+                print("🤖 Gemini 요약 시작")
+
+                summary = summarize_with_gemini(
+                    title,
+                    body,
+                )
+
+                save_article(
+                    category=category_name,
+                    title=title,
+                    url=url,
+                    summary=summary,
+                )
+
+                saved_count += 1
+
+            except Exception as e:
+
+                print()
+                print(
+                    f"   ❌ 기사 처리 실패: {e}"
+                )
+
+                # 한 기사 실패 때문에
+                # 다음 기사까지 중단하지 않는다.
+                continue
+
+            # API 서버에 너무 빠르게 요청하지 않도록
+            time.sleep(2)
+
+            # 이번 실행에서 너무 많은 기사 저장 방지
+            if saved_count >= MAX_ARTICLES_PER_CATEGORY:
+                print()
+                print(
+                    f"   📌 카테고리별 최대 "
+                    f"{MAX_ARTICLES_PER_CATEGORY}개 "
+                    f저장 완료"
                 )
                 break
 
-        # ----------------------------------------------------
-        # 본문 추출
-        # ----------------------------------------------------
-
-        article = extract_article(
-            url,
-            fallback_title=fallback_title,
+        print()
+        print(
+            f"✅ [{category_name}] "
+            f"수집 종료 - 새로 저장: "
+            f"{saved_count}개"
         )
 
-        if not article:
-            continue
+        return saved_count
 
-        # ----------------------------------------------------
-        # Gemini 요약
-        # ----------------------------------------------------
+    except Exception as e:
 
-        summary = summarize_with_gemini(
-            article["title"],
-            article["text"],
+        print()
+        print(
+            f"❌ [{category_name}] "
+            f"처리 실패"
         )
 
-        # ----------------------------------------------------
-        # Firestore 저장
-        # ----------------------------------------------------
-
-        save_article(
-            article=article,
-            summary=summary,
-            category=category_name,
-            source="Naver",
+        print(
+            f"   오류: {e}"
         )
 
-        saved_count += 1
-
-    print(
-        f"\n✅ [{category_name}] "
-        f"새 기사 {saved_count}개 저장"
-    )
-
-    return saved_count
+        return 0
 
 
 # ============================================================
@@ -891,81 +949,96 @@ def collect_naver_category(
 # ============================================================
 
 def collect_semiengineering():
-    candidates = extract_semiengineering_links()
+    print()
+    print("=" * 60)
+    print("📰 SemiEngineering 수집 시작")
+    print("=" * 60)
 
-    if not candidates:
-        print(
-            "❌ SemiEngineering에서 "
-            "'Chip Industry Week In Review'를 찾지 못했습니다."
+    try:
+
+        candidates = (
+            extract_semiengineering_links()
         )
-        return 0
 
-    saved_count = 0
-
-    for item in candidates:
-
-        if saved_count >= MAX_ARTICLES_PER_CATEGORY:
-            break
-
-        url = clean_url(item["url"])
-
-        print("\n" + "-" * 60)
-        print(f"📌 SemiEngineering 기사")
-        print(f"   {url}")
-
-        # ----------------------------------------------------
-        # Firestore 중복 확인
-        # ----------------------------------------------------
-
-        if is_already_collected(url):
+        if not candidates:
             print(
-                "⏭️ 이미 Firestore에 존재 → 건너뜀"
+                "   ⚠️ 수집할 SemiEngineering "
+                "기사가 없습니다."
             )
-            continue
+            return 0
 
-        # ----------------------------------------------------
-        # 본문
-        # ----------------------------------------------------
+        # 가장 최신 후보부터 확인
+        latest = candidates[0]
 
-        article = extract_article(
-            url,
-            fallback_title=item.get(
-                "title",
-                "",
-            ),
+        url = clean_url(
+            latest["url"]
         )
 
-        if not article:
-            continue
+        print()
+        print("------------------------------------------------------------")
+        print("📌 SemiEngineering 기사")
+        print(url)
+        print("------------------------------------------------------------")
 
-        # ----------------------------------------------------
-        # Gemini
-        # ----------------------------------------------------
+        # 중복 확인
+        if is_already_collected(url):
 
-        summary = summarize_with_gemini(
-            article["title"],
-            article["text"],
+            print(
+                "   ⏭️ 이미 수집된 기사 → 스킵"
+            )
+
+            return 0
+
+        try:
+
+            title, body = extract_article(
+                url
+            )
+
+            print()
+            print("🤖 Gemini 요약 시작")
+
+            summary = summarize_with_gemini(
+                title,
+                body,
+            )
+
+            save_article(
+                category="SemiEngineering",
+                title=title,
+                url=url,
+                summary=summary,
+            )
+
+            return 1
+
+        except Exception as e:
+
+            print()
+            print(
+                f"   ❌ [SemiEngineering] "
+                f"기사 처리 실패"
+            )
+
+            print(
+                f"   오류: {e}"
+            )
+
+            return 0
+
+    except Exception as e:
+
+        print()
+        print(
+            "❌ [SemiEngineering] "
+            "수집 실패"
         )
 
-        # ----------------------------------------------------
-        # Firestore
-        # ----------------------------------------------------
-
-        save_article(
-            article=article,
-            summary=summary,
-            category="SemiEngineering",
-            source="SemiEngineering",
+        print(
+            f"   오류: {e}"
         )
 
-        saved_count += 1
-
-    print(
-        f"\n✅ [SemiEngineering] "
-        f"새 기사 {saved_count}개 저장"
-    )
-
-    return saved_count
+        return 0
 
 
 # ============================================================
@@ -973,81 +1046,91 @@ def collect_semiengineering():
 # ============================================================
 
 def cleanup_old_articles():
-    print("\n" + "=" * 60)
+    print()
+    print("=" * 60)
     print("🧹 오래된 기사 정리 시작")
     print(
         f"   기준: {DELETE_AFTER_DAYS}일 경과 "
-        f"& 북마크 안 됨"
+        "& 북마크 안 됨"
     )
     print("=" * 60)
 
-    cutoff = datetime.now(
-        timezone.utc
-    ) - timedelta(
-        days=DELETE_AFTER_DAYS
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(
+            days=DELETE_AFTER_DAYS
+        )
     )
 
     deleted_count = 0
 
-    # --------------------------------------------------------
-    # composite index가 필요하지 않도록
-    # Firestore 전체 문서를 가져와 Python에서 필터링
-    # --------------------------------------------------------
-
     try:
+
         docs = (
             db.collection("news-summary")
+            .where(
+                filter=FieldFilter(
+                    "bookmarked",
+                    "==",
+                    False,
+                )
+            )
             .stream()
         )
 
         for doc in docs:
+
             data = doc.to_dict()
 
-            is_bookmarked = data.get(
-                "is_bookmarked",
-                False,
+            created_at = (
+                data.get("createdAt")
+                or data.get("collectedAt")
             )
-
-            created_at = data.get(
-                "created_at"
-            )
-
-            if is_bookmarked:
-                continue
 
             if not created_at:
                 continue
 
-            # Firestore Timestamp -> datetime
             try:
-                created_at_dt = created_at.replace(
-                    tzinfo=timezone.utc
-                )
-            except Exception:
-                created_at_dt = created_at
 
-            if created_at_dt < cutoff:
-                print(
-                    f"   🗑️ 삭제: "
-                    f"{data.get('title', '제목 없음')}"
+                # Firestore Timestamp
+                created_datetime = (
+                    created_at.replace(
+                        tzinfo=timezone.utc
+                    )
+                    if created_at.tzinfo is None
+                    else created_at
                 )
+
+            except Exception:
+                continue
+
+            if created_datetime < cutoff:
 
                 doc.reference.delete()
 
                 deleted_count += 1
 
-    except Exception as e:
+                print(
+                    f"   🗑️ 삭제: "
+                    f"{data.get('title', '(제목 없음)')}"
+                )
+
+        print()
         print(
-            f"❌ 오래된 기사 삭제 중 오류: {e}"
+            f"🧹 총 {deleted_count}개의 "
+            f"오래된 기사를 삭제했습니다."
         )
-        raise
 
-    print(
-        f"\n🧹 총 {deleted_count}개의 "
-        f"오래된 기사를 삭제했습니다."
-    )
+        return deleted_count
 
-    return deleted_count
+    except Exception as e:
+
+        print()
+        print(
+            f"❌ 오래된 기사 정리 실패: {e}"
+        )
+
+        return 0
 
 
 # ============================================================
@@ -1055,85 +1138,68 @@ def cleanup_old_articles():
 # ============================================================
 
 def main():
-    print("\n")
+
+    print()
     print("=" * 70)
     print("🚀 뉴스 자동 수집 시스템 시작")
     print("=" * 70)
 
     print(
         f"🕐 실행 시각: "
-        f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S KST')}"
+        f"{now_kst().strftime('%Y-%m-%d %H:%M:%S')} KST"
     )
 
     print(
         f"🤖 Gemini 모델: {GEMINI_MODEL}"
     )
 
+    print("=" * 70)
+
     total_saved = 0
 
     # --------------------------------------------------------
-    # Naver 2개
+    # Naver 뉴스
     # --------------------------------------------------------
 
     for issue in NAVER_ISSUES:
-        try:
-            count = collect_naver_category(issue)
-            total_saved += count
 
-        except Exception as e:
-            print(
-                f"\n❌ [{issue['name']}] 처리 실패"
-            )
-            print(f"   오류: {e}")
+        saved = collect_naver_category(
+            category_name=issue["name"],
+            issue_url=issue["url"],
+            search_query=issue["query"],
+        )
 
-            # 한 카테고리 실패 때문에
-            # 다른 카테고리까지 죽지 않게 한다.
-            continue
+        total_saved += saved
 
     # --------------------------------------------------------
     # SemiEngineering
     # --------------------------------------------------------
 
-    try:
-        count = collect_semiengineering()
-        total_saved += count
-
-    except Exception as e:
-        print(
-            "\n❌ [SemiEngineering] 처리 실패"
-        )
-        print(f"   오류: {e}")
+    total_saved += (
+        collect_semiengineering()
+    )
 
     # --------------------------------------------------------
-    # 오래된 기사 삭제
+    # 오래된 기사 정리
     # --------------------------------------------------------
 
     cleanup_old_articles()
 
     # --------------------------------------------------------
-    # 결과
+    # 종료
     # --------------------------------------------------------
 
-    print("\n" + "=" * 70)
+    print()
+    print("=" * 70)
     print("🏁 뉴스 자동 수집 시스템 종료")
     print("=" * 70)
+
     print(
         f"📥 이번 실행에서 새로 저장한 기사: "
         f"{total_saved}개"
     )
+
     print("=" * 70)
-
-    # --------------------------------------------------------
-    # 중요:
-    #
-    # 새 기사가 0개인 것은 정상일 수 있다.
-    # 이미 전부 Firestore에 있다면 0개가 된다.
-    #
-    # 따라서 total_saved == 0이라고 해서
-    # GitHub Actions를 실패시키지 않는다.
-    # --------------------------------------------------------
-
-    return total_saved
 
 
 # ============================================================
@@ -1141,14 +1207,17 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
         main()
 
     except Exception as e:
-        print("\n" + "=" * 70)
-        print("💥 치명적인 오류로 실행 실패")
+
+        print()
         print("=" * 70)
+        print("💥 프로그램 치명적 오류")
+        print("=" * 70)
+
         print(e)
-        print("=" * 70)
 
         raise
