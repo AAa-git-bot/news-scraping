@@ -1,5 +1,7 @@
-google-genai
-firebase-admin
-beautifulsoup4
-requests
-python-dateutil
+requests>=2.32.0
+beautifulsoup4>=4.12.0
+
+firebase-admin>=6.5.0
+google-cloud-firestore>=2.16.0
+
+google-genai>=1.0.0
