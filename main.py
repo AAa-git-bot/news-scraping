@@ -1,235 +1,1053 @@
+```python
 import os
 import json
+import re
+import html
 import requests
+
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
+
 from google import genai
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-print("🚀 스크립트 시작: 환경 변수 및 서비스 초기화를 진행합니다...")
 
-# ==========================================
-# 1. 환경 변수 및 서비스 초기화
-# ==========================================
-firebase_json_str = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+# ============================================================
+# 1. 수집 대상 설정
+# ============================================================
+
+NAVER_ISSUES = [
+    {
+        "name": "반도체 전쟁",
+        "url": "https://media.naver.com/issue/092/102",
+        "query": "반도체",
+    },
+    {
+        "name": "AI 핫트렌드",
+        "url": "https://media.naver.com/issue/092/492",
+        "query": "인공지능 AI",
+    },
+]
+
+MAX_ARTICLES_PER_CATEGORY = 5
+
+
+# ============================================================
+# 2. HTTP 설정
+# ============================================================
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,image/avif,image/webp,"
+        "*/*;q=0.8"
+    ),
+    "Accept-Language": (
+        "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+    ),
+    "Connection": "keep-alive",
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+# ============================================================
+# 3. Firebase 초기화
+# ============================================================
+
+firebase_json_str = os.environ.get(
+    "FIREBASE_SERVICE_ACCOUNT"
+)
+
 if firebase_json_str:
-    print("🔑 GitHub Secrets에서 FIREBASE_SERVICE_ACCOUNT를 불러왔습니다.")
-    cred_dict = json.loads(firebase_json_str)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
+    try:
+        cred_dict = json.loads(firebase_json_str)
+        cred = credentials.Certificate(cred_dict)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "FIREBASE_SERVICE_ACCOUNT가 올바른 JSON이 아닙니다."
+        ) from e
+
 else:
-    print("🔑 로컬 serviceAccountKey.json 파일을 사용합니다.")
-    cred = credentials.Certificate("serviceAccountKey.json")
+    if not os.path.exists("serviceAccountKey.json"):
+        raise FileNotFoundError(
+            "FIREBASE_SERVICE_ACCOUNT 환경변수도 없고 "
+            "serviceAccountKey.json 파일도 없습니다."
+        )
+
+    cred = credentials.Certificate(
+        "serviceAccountKey.json"
+    )
+
+
+if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
+
+# ============================================================
+# 4. Gemini 초기화
+# ============================================================
+
 gemini_api_key = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=gemini_api_key)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-}
+if not gemini_api_key:
+    raise RuntimeError(
+        "GEMINI_API_KEY 환경변수가 없습니다."
+    )
 
-# ==========================================
-# 2. 헬퍼 함수 정의
-# ==========================================
-def is_already_collected(url: str) -> bool:
-    """Firestore 'news-summary' 컬렉션에서 동일한 URL 문서가 있는지 검사합니다."""
-    docs = db.collection("news-summary").where("url", "==", url).limit(1).stream()
-    return any(docs)
+client = genai.Client(
+    api_key=gemini_api_key
+)
 
-def summarize_with_gemini(title: str, text: str, is_weekly_report: bool = False) -> str:
-    """Gemini API를 이용해 요약 및 인사이트를 작성합니다."""
-    if is_weekly_report:
-        prompt = f"""
-        다음은 지난 한 주간 수집된 주요 기사들의 요약 모음입니다.
-        전체 기사 내용을 바탕으로 반도체 및 AI 산업의 [주간 종합 요약 보고서]를 작성해 주세요.
-        
-        [내용]
-        {text}
 
-        [응답 형식]
-        1. 주간 핵심 요약 (3~5줄)
-        2. 이번 주 산업 인사이트 및 전망 (2~3줄)
-        """
-    else:
-        prompt = f"""
-        다음 기사 본문을 읽고 한국어로 핵심 요약과 인사이트를 작성해 주세요.
+# ============================================================
+# 5. URL 정규화
+# ============================================================
 
-        [기사 제목]: {title}
-        [기사 본문]: {text[:3000]}
+def clean_url(url: str) -> str:
+    """
+    URL에 섞여 들어온 HTML entity, Markdown 등을 제거하고
+    네이버 뉴스 URL을 정리한다.
+    """
 
-        [응답 형식]
-        - 핵심 요약 (3줄):
-        - 한 줄 인사이트:
-        """
+    if not url:
+        return ""
+
+    url = html.unescape(url).strip()
+
+    # 혹시 Markdown 링크가 들어온 경우 방어
+    markdown_match = re.match(
+        r"\[.*?\]\((https?://[^)]+)\)",
+        url
+    )
+
+    if markdown_match:
+        url = markdown_match.group(1)
+
+    # //example.com 형태
+    if url.startswith("//"):
+        url = "https:" + url
+
+    # 모바일 네이버 뉴스 → n.news.naver.com
+    url = url.replace(
+        "https://m.news.naver.com",
+        "https://n.news.naver.com"
+    )
+
+    url = url.replace(
+        "http://m.news.naver.com",
+        "https://n.news.naver.com"
+    )
+
+    return url
+
+
+# ============================================================
+# 6. HTTP GET 공통 함수
+# ============================================================
+
+def get_page(url: str, timeout: int = 15):
+    """
+    HTTP GET 요청.
+    상태 코드와 최종 URL을 확인한다.
+    """
+
+    url = clean_url(url)
+
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"잘못된 URL입니다: {url}"
+        )
+
+    response = session.get(
+        url,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+
+    response.raise_for_status()
+
+    # 한글 인코딩 보정
+    if not response.encoding:
+        response.encoding = response.apparent_encoding
+
+    return response
+
+
+# ============================================================
+# 7. 네이버 이슈 페이지 기사 URL 추출
+# ============================================================
+
+def extract_naver_article_links(issue_url: str):
+
+    issue_url = clean_url(issue_url)
+
+    print()
+    print("🌐 네이버 이슈 페이지 요청")
+    print(f"   URL: {issue_url}")
+
+    try:
+        response = get_page(issue_url)
+
+    except requests.HTTPError as e:
+        print(f"❌ HTTP 오류: {e}")
+        return []
+
+    except requests.RequestException as e:
+        print(f"❌ 네트워크 오류: {e}")
+        return []
+
+    except Exception as e:
+        print(f"❌ 페이지 요청 오류: {e}")
+        return []
+
+    print(
+        f"   HTTP 상태: {response.status_code}"
+    )
+
+    print(
+        f"   최종 URL: {response.url}"
+    )
+
+    print(
+        f"   HTML 크기: {len(response.text):,} bytes"
+    )
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+    results = []
+    seen = set()
+
+    # --------------------------------------------------------
+    # 방법 1
+    # HTML의 모든 a[href] 검사
+    # --------------------------------------------------------
+
+    for a in soup.select("a[href]"):
+
+        href = a.get("href", "").strip()
+
+        title = a.get_text(
+            " ",
+            strip=True
+        )
+
+        if not href:
+            continue
+
+        href = html.unescape(href)
+
+        # 상대 URL → 절대 URL
+        href = urljoin(
+            response.url,
+            href
+        )
+
+        href = clean_url(href)
+
+        # 네이버 기사 URL인지 확인
+        is_naver_article = any(
+            pattern in href
+            for pattern in [
+                "n.news.naver.com/article/",
+                "news.naver.com/article/",
+                "n.news.naver.com/mnews/article/",
+                "news.naver.com/mnews/article/",
+            ]
+        )
+
+        if not is_naver_article:
+            continue
+
+        if len(title) < 5:
+            continue
+
+        if href in seen:
+            continue
+
+        seen.add(href)
+
+        results.append({
+            "title": title,
+            "url": href,
+        })
+
+    # --------------------------------------------------------
+    # 방법 2
+    # HTML 문자열 안에 직접 들어 있는 URL 검사
+    # --------------------------------------------------------
+
+    url_pattern = re.compile(
+        r'https?://(?:n\.)?news\.naver\.com/'
+        r'(?:mnews/)?article/\d+/\d+'
+    )
+
+    for match in url_pattern.findall(
+        response.text
+    ):
+
+        url = clean_url(match)
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+
+        results.append({
+            "title": "",
+            "url": url,
+        })
+
+    print(
+        f"🔎 발견된 네이버 기사 링크: "
+        f"{len(results)}개"
+    )
+
+    # 디버깅을 위해 처음 10개 출력
+    for i, article in enumerate(
+        results[:10],
+        start=1
+    ):
+        print(
+            f"   {i}. "
+            f"{article['title'][:60]} "
+            f"→ {article['url']}"
+        )
+
+    return results
+
+
+# ============================================================
+# 8. 네이버 뉴스 검색 API
+# ============================================================
+
+def search_naver_news_api(
+    query: str,
+    display: int = 30
+):
+
+    client_id = os.environ.get(
+        "NAVER_CLIENT_ID"
+    )
+
+    client_secret = os.environ.get(
+        "NAVER_CLIENT_SECRET"
+    )
+
+    # API 설정이 없으면 fallback 사용 안 함
+    if not client_id or not client_secret:
+
+        print(
+            "ℹ️ NAVER_CLIENT_ID / "
+            "NAVER_CLIENT_SECRET가 없습니다."
+        )
+
+        print(
+            "   네이버 뉴스 API fallback을 "
+            "건너뜁니다."
+        )
+
+        return []
+
+    api_url = (
+        "https://openapi.naver.com/"
+        "v1/search/news.json"
+    )
+
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+
+    params = {
+        "query": query,
+        "display": min(display, 100),
+        "start": 1,
+        "sort": "date",
+    }
+
+    print()
+    print(
+        f"🔄 네이버 뉴스 API 요청: "
+        f"{query}"
+    )
+
+    try:
+
+        response = requests.get(
+            api_url,
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+    except requests.HTTPError as e:
+
+        print(
+            f"❌ 네이버 API HTTP 오류: {e}"
+        )
+
+        return []
+
+    except Exception as e:
+
+        print(
+            f"❌ 네이버 API 요청 실패: {e}"
+        )
+
+        return []
+
+    results = []
+
+    for item in data.get(
+        "items",
+        []
+    ):
+
+        title = BeautifulSoup(
+            item.get("title", ""),
+            "html.parser"
+        ).get_text(
+            " ",
+            strip=True
+        )
+
+        link = clean_url(
+            item.get("link", "")
+        )
+
+        description = BeautifulSoup(
+            item.get("description", ""),
+            "html.parser"
+        ).get_text(
+            " ",
+            strip=True
+        )
+
+        if not link:
+            continue
+
+        results.append({
+            "title": title,
+            "url": link,
+            "description": description,
+        })
+
+    print(
+        f"🔎 네이버 뉴스 API 결과: "
+        f"{len(results)}개"
+    )
+
+    return results
+
+
+# ============================================================
+# 9. 기사 제목 / 본문 추출
+# ============================================================
+
+def extract_article(
+    url: str,
+    fallback_title: str = ""
+):
+
+    url = clean_url(url)
+
+    print()
+    print(
+        f"   📰 기사 페이지 요청: {url}"
+    )
+
+    try:
+
+        response = get_page(url)
+
+    except requests.HTTPError as e:
+
+        print(
+            f"   ❌ 기사 HTTP 오류: {e}"
+        )
+
+        return None
+
+    except Exception as e:
+
+        print(
+            f"   ❌ 기사 요청 실패: {e}"
+        )
+
+        return None
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+    # --------------------------------------------------------
+    # 제목
+    # --------------------------------------------------------
+
+    title = fallback_title
+
+    title_selectors = [
+        "h2#title_area",
+        "h2.media_end_head_headline",
+        "h1",
+        "meta[property='og:title']",
+        "title",
+    ]
+
+    for selector in title_selectors:
+
+        element = soup.select_one(
+            selector
+        )
+
+        if not element:
+            continue
+
+        if element.name == "meta":
+
+            candidate = element.get(
+                "content",
+                ""
+            ).strip()
+
+        else:
+
+            candidate = element.get_text(
+                " ",
+                strip=True
+            )
+
+        if candidate:
+
+            title = candidate
+
+            break
+
+    # --------------------------------------------------------
+    # 본문
+    # --------------------------------------------------------
+
+    body_selectors = [
+        "div#dic_area",
+        "div#newsct_article",
+        "article#dic_area",
+        "div.newsct_article",
+        "div.article_body",
+        "article",
+    ]
+
+    body = None
+
+    for selector in body_selectors:
+
+        element = soup.select_one(
+            selector
+        )
+
+        if element:
+
+            body = element
+
+            break
+
+    body_text = ""
+
+    if body:
+
+        # 불필요한 요소 제거
+        for tag in body.select(
+            "script, style, iframe, "
+            "figure, button, "
+            ".byline, .copyright, "
+            ".media_end_head_info_datestamp"
+        ):
+
+            tag.decompose()
+
+        body_text = body.get_text(
+            "\n",
+            strip=True
+        )
+
+    # --------------------------------------------------------
+    # og:description 보조
+    # --------------------------------------------------------
+
+    if len(body_text) < 100:
+
+        meta = soup.select_one(
+            "meta[property='og:description']"
+        )
+
+        if meta:
+
+            description = meta.get(
+                "content",
+                ""
+            ).strip()
+
+            if len(description) > len(
+                body_text
+            ):
+                body_text = description
+
+    # --------------------------------------------------------
+    # 공백 정리
+    # --------------------------------------------------------
+
+    body_text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        body_text
+    )
+
+    body_text = re.sub(
+        r"[ \t]+",
+        " ",
+        body_text
+    )
+
+    print(
+        f"   제목: {title[:100]}"
+    )
+
+    print(
+        f"   본문 길이: "
+        f"{len(body_text):,}자"
+    )
+
+    if not title:
+
+        print(
+            "   ⚠️ 기사 제목을 찾지 못했습니다."
+        )
+
+        return None
+
+    if len(body_text) < 100:
+
+        print(
+            "   ⚠️ 기사 본문이 너무 짧습니다."
+        )
+
+        return None
+
+    return {
+        "title": title,
+        "url": url,
+        "body": body_text,
+    }
+
+
+# ============================================================
+# 10. Firestore 중복 검사
+# ============================================================
+
+def is_already_collected(
+    url: str
+) -> bool:
+
+    url = clean_url(url)
+
+    try:
+
+        docs = (
+            db.collection("news-summary")
+            .where(
+                "url",
+                "==",
+                url
+            )
+            .limit(1)
+            .stream()
+        )
+
+        return any(docs)
+
+    except Exception as e:
+
+        print(
+            f"⚠️ Firestore 중복 검사 실패: {e}"
+        )
+
+        # 중복 여부를 확인하지 못했으므로
+        # 안전하게 True 처리하여 중복 저장 방지
+        return True
+
+
+# ============================================================
+# 11. Gemini 요약
+# ============================================================
+
+def summarize_with_gemini(
+    title: str,
+    text: str
+) -> str:
+
+    prompt = f"""
+당신은 한국어 뉴스 분석가입니다.
+
+아래 뉴스 기사를 읽고 반드시 다음 형식으로 작성하세요.
+
+[요약 1]
+핵심 사실을 한 문장으로 작성
+
+[요약 2]
+중요한 변화, 수치 또는 사건을 한 문장으로 작성
+
+[요약 3]
+산업 또는 시장에 미치는 영향을 한 문장으로 작성
+
+[인사이트]
+이 기사가 반도체/AI 산업에 의미하는 바를 한 문장으로 작성
+
+규칙:
+- 한국어로 작성하세요.
+- 기사에 없는 사실을 추가하지 마세요.
+- 추측은 사실처럼 표현하지 마세요.
+- 불필요한 서론은 작성하지 마세요.
+- 전체적으로 간결하게 작성하세요.
+
+[제목]
+{title}
+
+[본문]
+{text[:12000]}
+"""
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=prompt
+        contents=prompt,
     )
-    return response.text
 
-# ==========================================
-# 3. 크롤링 로직 (네이버 뉴스 모바일 파싱 방식)
-# ==========================================
-def fetch_naver_issue_articles(issue_url: str, category_name: str):
-    print(f"\n[네이버 크롤링] {category_name} 수집 시작... ({issue_url})")
-    
-    # 모바일 주소 변환
-    m_url = issue_url.replace("media.naver.com", "m.news.naver.com")
-    res = requests.get(m_url, headers=HEADERS)
-    soup = BeautifulSoup(res.text, "html.parser")
-    
-    links = soup.find_all("a")
-    valid_links = []
-    
-    for a in links:
-        href = a.get("href", "")
-        title = a.get_text(strip=True)
-        if "/article/" in href and len(title) > 8:
-            if not href.startswith("http"):
-                href = "https://n.news.naver.com" + href if href.startswith("/") else "https://n.news.naver.com/" + href
-            valid_links.append((title, href))
+    if not response.text:
 
-    print(f"🔎 발견된 기사 후보: {len(valid_links)}개")
-    
+        raise RuntimeError(
+            "Gemini 응답이 비어 있습니다."
+        )
+
+    return response.text.strip()
+
+
+# ============================================================
+# 12. 네이버 이슈 수집
+# ============================================================
+
+def fetch_naver_issue_articles(
+    issue_url: str,
+    category_name: str,
+    fallback_query: str,
+):
+
+    print()
+    print("=" * 70)
+
+    print(
+        f"[{category_name}] "
+        f"네이버 뉴스 수집 시작"
+    )
+
+    print(
+        f"URL: {issue_url}"
+    )
+
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # 1차: 이슈 페이지 직접 크롤링
+    # --------------------------------------------------------
+
+    articles = extract_naver_article_links(
+        issue_url
+    )
+
+    # --------------------------------------------------------
+    # 2차: 기사 0개이면 뉴스 API fallback
+    # --------------------------------------------------------
+
+    if not articles:
+
+        print()
+        print(
+            "⚠️ 이슈 페이지에서 "
+            "기사 링크를 찾지 못했습니다."
+        )
+
+        print(
+            f"🔄 뉴스 API fallback: "
+            f"{fallback_query}"
+        )
+
+        articles = search_naver_news_api(
+            fallback_query,
+            display=30
+        )
+
+    if not articles:
+
+        print(
+            f"❌ [{category_name}] "
+            f"수집 가능한 기사가 없습니다."
+        )
+
+        return 0
+
     collected_count = 0
-    saved_urls = set()
 
-    for title, url in valid_links:
-        if url in saved_urls:
+    seen_urls = set()
+
+    # --------------------------------------------------------
+    # 기사별 처리
+    # --------------------------------------------------------
+
+    for candidate in articles:
+
+        if (
+            collected_count
+            >= MAX_ARTICLES_PER_CATEGORY
+        ):
+            break
+
+        raw_url = candidate.get(
+            "url",
+            ""
+        )
+
+        url = clean_url(raw_url)
+
+        if not url:
             continue
-        saved_urls.add(url)
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+
+        # ----------------------------------------------------
+        # Firestore 중복 검사
+        # ----------------------------------------------------
 
         if is_already_collected(url):
-            print(f"ℹ️ [중복 스킵] {title[:20]}...")
+
+            print(
+                f"⏭️ 이미 수집된 기사: {url}"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # 기사 본문 가져오기
+        # ----------------------------------------------------
+
+        article = extract_article(
+            url=url,
+            fallback_title=candidate.get(
+                "title",
+                ""
+            )
+        )
+
+        if not article:
             continue
 
         try:
-            print(f"📄 기사 본문 수집 중: {title[:25]}...")
-            art_res = requests.get(url, headers=HEADERS)
-            art_soup = BeautifulSoup(art_res.text, "html.parser")
-            
-            body = art_soup.find("article") or art_soup.find("div", id="newsct_article") or art_soup.find("div", id="dic_area")
-            body_text = body.get_text(strip=True) if body else title
 
-            print("🤖 Gemini 요약 요청 중...")
-            summary = summarize_with_gemini(title, body_text)
+            # ------------------------------------------------
+            # Gemini
+            # ------------------------------------------------
+
+            print(
+                "   🤖 Gemini 요약 시작..."
+            )
+
+            summary = summarize_with_gemini(
+                title=article["title"],
+                text=article["body"],
+            )
+
+            # ------------------------------------------------
+            # Firestore 저장
+            # ------------------------------------------------
 
             doc_data = {
-                "title": title,
-                "url": url,
+                "title": article["title"],
+                "url": article["url"],
                 "summary": summary,
                 "category": category_name,
                 "is_bookmarked": False,
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(
+                    timezone.utc
+                ),
             }
-            db.collection("news-summary").add(doc_data)
-            print(f"✅ [Firestore 저장 완료] {title[:25]}...")
-            
+
+            db.collection(
+                "news-summary"
+            ).add(doc_data)
+
+            print(
+                "   ✅ Firestore 저장 완료"
+            )
+
+            print(
+                f"      {article['title'][:100]}"
+            )
+
             collected_count += 1
-            if collected_count >= 5: # 카테고리당 최대 5개 수집
-                break
 
         except Exception as e:
-            print(f"❌ 기사 처리 중 오류: {e}")
 
-def fetch_semi_engineering():
-    print("\n[SemiEngineering] 아티클 수집 시작...")
-    list_url = "https://semiengineering.com/author/se-staff/"
-    res = requests.get(list_url, headers=HEADERS)
-    soup = BeautifulSoup(res.text, "html.parser")
-    
-    for article in soup.select("article, h3.entry-title a, h2 a"):
-        title = article.get_text(strip=True)
-        url = article.get("href") if article.name == "a" else (article.find("a").get("href") if article.find("a") else None)
-        
-        if url and "Chip Industry Week In Review" in title:
-            if is_already_collected(url):
-                print(f"ℹ️ 이미 수집된 아티클입니다: {title}")
-                break
-            
-            art_res = requests.get(url, headers=HEADERS)
-            art_soup = BeautifulSoup(art_res.text, "html.parser")
-            body = art_soup.find("div", class_="entry-content")
-            body_text = body.get_text(strip=True) if body else title
-            
-            summary = summarize_with_gemini(title, body_text)
-            
-            doc_data = {
-                "title": title,
-                "url": url,
-                "summary": summary,
-                "category": "Chip Industry Week In Review",
-                "is_bookmarked": True,
-                "created_at": datetime.now(timezone.utc)
-            }
-            db.collection("news-summary").add(doc_data)
-            print(f"✅ 해외 주간 아티클 저장 완료: {title}")
-            break
+            print(
+                f"   ❌ 기사 처리 중 오류: {e}"
+            )
 
-# ==========================================
-# 4. 부가 기능
-# ==========================================
+    print()
+    print(
+        f"📊 [{category_name}] "
+        f"신규 수집: "
+        f"{collected_count}건"
+    )
+
+    return collected_count
+
+
+# ============================================================
+# 13. 7일 지난 미북마크 기사 삭제
+# ============================================================
+
 def cleanup_old_articles():
-    print("\n🧹 오래된 기사 정리 시작...")
-    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
-    
-    docs = db.collection("news-summary") \
-             .where("created_at", "<", seven_days_ago) \
-             .stream()
-    
-    count = 0
-    for doc in docs:
-        data = doc.to_dict()
-        if not data.get("is_bookmarked", False):
+
+    print()
+    print(
+        "🧹 오래된 기사 정리를 시작합니다 "
+        "(7일 경과 & 북마크 안 됨)..."
+    )
+
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(days=7)
+    )
+
+    try:
+
+        docs = (
+            db.collection("news-summary")
+            .where(
+                "is_bookmarked",
+                "==",
+                False
+            )
+            .where(
+                "created_at",
+                "<",
+                cutoff
+            )
+            .stream()
+        )
+
+        deleted_count = 0
+
+        for doc in docs:
+
+            print(
+                f"   🗑️ 삭제: {doc.id}"
+            )
+
             doc.reference.delete()
-            count += 1
-    print(f"🧹 총 {count}개의 오래된 기사가 삭제되었습니다.")
 
-def generate_weekly_report():
-    print("\n📊 주간 종합 보고서 생성 시작...")
-    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
-    
-    docs = db.collection("news-summary") \
-             .where("created_at", ">=", seven_days_ago) \
-             .stream()
-    
-    summaries_text = ""
-    for doc in docs:
-        data = doc.to_dict()
-        summaries_text += f"- [{data.get('category')}] {data.get('title')}\n  요약: {data.get('summary')}\n\n"
-    
-    if summaries_text:
-        weekly_summary = summarize_with_gemini("주간 종합 리포트", summaries_text, is_weekly_report=True)
-        
-        report_data = {
-            "title": f"주간 반도체 & AI 종합 리포트 ({datetime.now().strftime('%Y-%m-%d')})",
-            "url": "",
-            "summary": weekly_summary,
-            "category": "주간 보고서",
-            "is_bookmarked": True,
-            "created_at": datetime.now(timezone.utc)
-        }
-        db.collection("news-summary").add(report_data)
-        print("✅ 주간 종합 보고서 저장 완료!")
+            deleted_count += 1
 
-# ==========================================
-# 5. 메인 실행
-# ==========================================
-if __name__ == "__main__":
-    now_utc = datetime.now(timezone.utc)
-    is_saturday = (now_utc.weekday() == 5)
+        print(
+            f"🧹 총 {deleted_count}개의 "
+            f"오래된 기사가 삭제되었습니다."
+        )
 
-    fetch_naver_issue_articles("https://media.naver.com/issue/092/102", "반도체 전쟁")
-    fetch_naver_issue_articles("https://media.naver.com/issue/092/492", "AI 핫트렌드")
-    
-    if is_saturday:
-        fetch_semi_engineering()
-        generate_weekly_report()
-        
+    except Exception as e:
+
+        print(
+            f"❌ 오래된 기사 삭제 실패: {e}"
+        )
+
+
+# ============================================================
+# 14. Main
+# ============================================================
+
+def main():
+
+    total_collected = 0
+
+    print()
+    print("=" * 70)
+    print("🚀 뉴스 수집 프로그램 시작")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # 네이버 이슈 수집
+    # --------------------------------------------------------
+
+    for issue in NAVER_ISSUES:
+
+        count = fetch_naver_issue_articles(
+            issue_url=issue["url"],
+            category_name=issue["name"],
+            fallback_query=issue["query"],
+        )
+
+        total_collected += count
+
+    # --------------------------------------------------------
+    # 오래된 기사 삭제
+    # --------------------------------------------------------
+
     cleanup_old_articles()
-    print("\n🎉 모든 작업이 정상적으로 종료되었습니다.")
+
+    # --------------------------------------------------------
+    # 최종 결과
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+
+    print(
+        f"🏁 전체 신규 수집: "
+        f"{total_collected}건"
+    )
+
+    print("=" * 70)
+
+    # 주의:
+    # 0건이라고 해서 반드시 오류는 아니다.
+    #
+    # 이미 Firestore에 모든 기사가 들어있을 경우
+    # 정상적으로 0건이 될 수 있다.
+    #
+    # 따라서 여기서는 exit code 1을 발생시키지 않는다.
+
+
+# ============================================================
+# 실행
+# ============================================================
+
+if __name__ == "__main__":
+    main()
+```
