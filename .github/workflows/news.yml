@@ -61,7 +61,7 @@ jobs:
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
 
           # 기본값은 main.py에서 gemini-2.5-flash
-          GEMINI_MODEL: gemini-2.5-flash
+          GEMINI_MODEL: gemini-3.8-flash
 
           PYTHONUNBUFFERED: "1"
 
