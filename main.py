@@ -7,27 +7,31 @@ from google import genai
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+print("🚀 스크립트 시작: 환경 변수 및 서비스 초기화를 진행합니다...")
+
 # ==========================================
 # 1. 환경 변수 및 서비스 초기화
 # ==========================================
 firebase_json_str = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 if firebase_json_str:
+    print("🔑 GitHub Secrets에서 FIREBASE_SERVICE_ACCOUNT를 불러왔습니다.")
     cred_dict = json.loads(firebase_json_str)
     cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
 else:
+    print("🔑 로컬 serviceAccountKey.json 파일을 사용합니다.")
     cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
 gemini_api_key = os.environ.get("GEMINI_API_KEY")
+if not gemini_api_key:
+    print("⚠️ GEMINI_API_KEY가 등록되어 있지 않습니다!")
 client = genai.Client(api_key=gemini_api_key)
 
-# 네이버 차단 회피용 Header 강화
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Referer": "https://media.naver.com/"
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
 }
 
 # ==========================================
@@ -71,54 +75,53 @@ def summarize_with_gemini(title: str, text: str, is_weekly_report: bool = False)
     return response.text
 
 # ==========================================
-# 3. 크롤링 로직 (네이버 뉴스 태그 파싱 강화)
+# 3. 크롤링 로직 (모바일/PC 하이브리드 네이버 수집)
 # ==========================================
 def fetch_naver_issue_articles(issue_url: str, category_name: str):
-    """네이버 뉴스 이슈 페이지에서 최근 기사를 다각도로 파싱합니다."""
-    print(f"[{category_name}] 네이버 뉴스 수집 시작: {issue_url}")
-    res = requests.get(issue_url, headers=HEADERS)
+    print(f"\n[네이버 크롤링] {category_name} 수집 시작... ({issue_url})")
+    
+    # 모바일 주소 변환 (크롤링이 훨씬 잘 됨)
+    m_url = issue_url.replace("media.naver.com", "m.news.naver.com")
+    res = requests.get(m_url, headers=HEADERS)
     soup = BeautifulSoup(res.text, "html.parser")
     
-    # 다양한 네이버 이슈 페이지 구조 대응 선택자
-    articles = soup.select("a[href*='article'], a.news_tit, a.cjs_news_a, div.news_text a, li a")
+    # 기사 링크 추출
+    links = soup.find_all("a")
+    valid_links = []
     
-    collected_urls = set()
-    collected_count = 0
-
-    for a in articles:
-        url = a.get("href")
+    for a in links:
+        href = a.get("href", "")
         title = a.get_text(strip=True)
-        
-        # 유효한 기사 링크만 필터링 (네이버 뉴스 본문 URL 패턴 검사)
-        if not url or not ("mnews.naver.com" in url or "news.naver.com" in url or "/article/" in url):
+        if "/article/" in href and len(title) > 8:
+            if not href.startswith("http"):
+                href = "https://n.news.naver.com" + href if href.startswith("/") else "https://n.news.naver.com/" + href
+            valid_links.append((title, href))
+
+    print(f"🔎 발견된 기사 후보 수: {len(valid_links)}개")
+    
+    collected_count = 0
+    saved_urls = set()
+
+    for title, url in valid_links:
+        if url in saved_urls:
             continue
-            
-        if url.startswith("//"):
-            url = "https:" + url
-        elif url.startswith("/"):
-            url = "https://media.naver.com" + url
+        saved_urls.add(url)
 
-        if url in collected_urls or len(title) < 5:
-            continue
-
-        collected_urls.add(url)
-
-        # 중복 저장 여부 확인
         if is_already_collected(url):
-            print(f"ℹ️ 이미 수집된 기사 스킵: {title}")
+            print(f"ℹ️ [중복 스킵] {title[:20]}...")
             continue
 
-        # 기사 본문 가져오기
         try:
+            print(f"📄 기사 본문 수집 중: {title[:25]}...")
             art_res = requests.get(url, headers=HEADERS)
             art_soup = BeautifulSoup(art_res.text, "html.parser")
-            body = art_soup.find("article") or art_soup.find("div", id="newsct_article") or art_soup.find("div", id="articleBodyContents")
+            
+            body = art_soup.find("article") or art_soup.find("div", id="newsct_article") or art_soup.find("div", id="dic_area")
             body_text = body.get_text(strip=True) if body else title
 
-            # Gemini 요약 생성
+            print("🤖 Gemini 요약 요청 중...")
             summary = summarize_with_gemini(title, body_text)
 
-            # Firestore 저장
             doc_data = {
                 "title": title,
                 "url": url,
@@ -128,18 +131,17 @@ def fetch_naver_issue_articles(issue_url: str, category_name: str):
                 "created_at": datetime.now(timezone.utc)
             }
             db.collection("news-summary").add(doc_data)
-            print(f"✅ 저장 완료: [{category_name}] {title}")
+            print(f"✅ [Firestore 저장 완료] {title[:25]}...")
             
             collected_count += 1
-            if collected_count >= 5: # 1회 수집 시 카테고리당 최대 5개 기사
+            if collected_count >= 5: # 카테고리당 최대 5개 수집
                 break
 
         except Exception as e:
-            print(f"❌ 기사 처리 중 오류 발생 ({url}): {e}")
+            print(f"❌ 기사 처리 중 오류: {e}")
 
 def fetch_semi_engineering():
-    """SemiEngineering에서 아티클 수집"""
-    print("[SemiEngineering] 아티클 수집 시작...")
+    print("\n[SemiEngineering] 아티클 수집 시작...")
     list_url = "https://semiengineering.com/author/se-staff/"
     res = requests.get(list_url, headers=HEADERS)
     soup = BeautifulSoup(res.text, "html.parser")
@@ -176,8 +178,7 @@ def fetch_semi_engineering():
 # 4. 부가 기능
 # ==========================================
 def cleanup_old_articles():
-    """7일 이상 지난 미북마크 기사 정리"""
-    print("🧹 오래된 기사 정리를 시작합니다...")
+    print("\n🧹 오래된 기사 정리 시작...")
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     
     docs = db.collection("news-summary") \
@@ -193,8 +194,7 @@ def cleanup_old_articles():
     print(f"🧹 총 {count}개의 오래된 기사가 삭제되었습니다.")
 
 def generate_weekly_report():
-    """주간 보고서 생성"""
-    print("📊 주간 종합 보고서 생성을 시작합니다...")
+    print("\n📊 주간 종합 보고서 생성 시작...")
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     
     docs = db.collection("news-summary") \
@@ -235,3 +235,4 @@ if __name__ == "__main__":
         generate_weekly_report()
         
     cleanup_old_articles()
+    print("\n🎉 모든 작업이 정상적으로 종료되었습니다.")
