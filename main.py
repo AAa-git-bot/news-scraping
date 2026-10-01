@@ -1,8 +1,9 @@
+import json
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,19 +13,12 @@ from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from google import genai
+from google.genai import types
 
 
 # ============================================================
 # 기본 설정
 # ============================================================
-
-KST = timezone(timedelta(hours=9))
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-
-MAX_ARTICLES_PER_CATEGORY = 5
-MIN_ARTICLE_LENGTH = 200
-DELETE_AFTER_DAYS = 7
 
 NAVER_ISSUES = [
     {
@@ -43,6 +37,91 @@ SEMIENGINEERING_AUTHOR_URL = (
     "https://semiengineering.com/author/se-staff/"
 )
 
+# Gemini 모델
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash",
+)
+
+# 카테고리별 저장 최대 개수
+MAX_ARTICLES_PER_CATEGORY = int(
+    os.getenv("MAX_ARTICLES_PER_CATEGORY", "5")
+)
+
+# 카테고리별 실제 Gemini 처리 시도 최대 개수
+#
+# 중요:
+# 기존 코드는 "저장 성공 5개"를 만들기 위해
+# 146개 후보를 계속 순회하면서 Gemini를 호출할 수 있었음.
+#
+# 이제는 새로운 기사 자체를 최대 5개까지만 시도한다.
+MAX_NEW_ARTICLES_PER_CATEGORY = int(
+    os.getenv("MAX_NEW_ARTICLES_PER_CATEGORY", "5")
+)
+
+# 한 번의 GitHub Actions 실행에서 Gemini API 호출 최대 횟수
+#
+# 503 재시도도 API 호출로 계산한다.
+# 무료 quota가 20회인 환경을 고려하여 15회로 여유를 둔다.
+MAX_GEMINI_CALLS_PER_RUN = int(
+    os.getenv("MAX_GEMINI_CALLS_PER_RUN", "15")
+)
+
+# 기사 본문 최소 길이
+MIN_ARTICLE_LENGTH = int(
+    os.getenv("MIN_ARTICLE_LENGTH", "200")
+)
+
+# 7일보다 오래된 미북마크 기사 삭제
+DELETE_AFTER_DAYS = int(
+    os.getenv("DELETE_AFTER_DAYS", "7")
+)
+
+# HTTP timeout
+HTTP_TIMEOUT = int(
+    os.getenv("HTTP_TIMEOUT", "20")
+)
+
+# Gemini 503 재시도 횟수
+MAX_GEMINI_503_RETRIES = int(
+    os.getenv("MAX_GEMINI_503_RETRIES", "2")
+)
+
+# Gemini 503 재시도 간격
+GEMINI_RETRY_DELAYS = [5, 10]
+
+
+# ============================================================
+# 전역 상태
+# ============================================================
+
+gemini_calls_used = 0
+
+# 일일 quota 초과 등으로 Gemini를 더 이상 호출하지 않도록 하는 플래그
+gemini_quota_exhausted = False
+
+
+# ============================================================
+# 예외 클래스
+# ============================================================
+
+class GeminiQuotaExceeded(Exception):
+    """Gemini 일일 quota 또는 사용량 quota 초과."""
+
+    pass
+
+
+class GeminiCallBudgetExceeded(Exception):
+    """이번 실행에서 허용한 Gemini API 호출 횟수 초과."""
+
+    pass
+
+
+class GeminiTemporaryError(Exception):
+    """Gemini 일시적인 오류."""
+
+    pass
+
 
 # ============================================================
 # HTTP 설정
@@ -52,9 +131,14 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
 }
 
 
@@ -66,17 +150,32 @@ session.headers.update(HEADERS)
 # Firebase 초기화
 # ============================================================
 
-def init_firestore():
-    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+def init_firebase():
+    """
+    FIREBASE_SERVICE_ACCOUNT 환경변수의 JSON으로 Firebase 초기화.
+    """
+
+    service_account_json = os.getenv(
+        "FIREBASE_SERVICE_ACCOUNT"
+    )
 
     if not service_account_json:
         raise RuntimeError(
             "FIREBASE_SERVICE_ACCOUNT 환경변수가 없습니다."
         )
 
+    try:
+        service_account_info = json.loads(
+            service_account_json
+        )
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "FIREBASE_SERVICE_ACCOUNT가 올바른 JSON이 아닙니다."
+        ) from e
+
     if not firebase_admin._apps:
         cred = credentials.Certificate(
-            eval_service_account_json(service_account_json)
+            service_account_info
         )
 
         firebase_admin.initialize_app(cred)
@@ -84,57 +183,52 @@ def init_firestore():
     return firestore.client()
 
 
-def eval_service_account_json(value):
-    """
-    GitHub Secret에 저장된 Firebase Service Account JSON을
-    안전하게 JSON으로 파싱한다.
-    """
-
-    import json
-
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT가 올바른 JSON 형식이 아닙니다."
-        ) from e
-
-
-db = init_firestore()
-
-
 # ============================================================
 # Gemini 초기화
 # ============================================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+def init_gemini():
+    """
+    Gemini Client 초기화.
 
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY 환경변수가 없습니다."
+    중요:
+    google-genai SDK 자체의 자동 retry를 끈다.
+
+    그래야 우리가
+    - 429 quota
+    - 429 rate limit
+    - 503
+    를 직접 구분하고 제어할 수 있다.
+    """
+
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY 환경변수가 없습니다."
+        )
+
+    http_options = types.HttpOptions(
+        retry_options=types.HttpRetryOptions(
+            attempts=1
+        )
     )
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=http_options,
+    )
+
+    return client
 
 
 # ============================================================
-# 공통 함수
+# URL 정리
 # ============================================================
-
-def now_kst():
-    return datetime.now(KST)
-
 
 def clean_url(url):
     """
-    Markdown 링크 형태가 들어와도 실제 URL만 추출한다.
-
-    예:
-    [https://example.com](https://example.com)
-    ->
-    https://example.com
+    URL을 비교/저장하기 위한 기본 정리.
     """
 
     if not url:
@@ -142,73 +236,116 @@ def clean_url(url):
 
     url = url.strip()
 
-    markdown_match = re.match(
-        r"^\[.*?\]\((https?://[^)]+)\)$",
-        url
-    )
+    if not url:
+        return ""
 
-    if markdown_match:
-        url = markdown_match.group(1)
+    parsed = urlparse(url)
 
-    # 혹시 문자열 중간에 Markdown URL이 들어온 경우
-    if "](" in url and url.endswith(")"):
-        match = re.search(
-            r"\((https?://[^)]+)\)$",
-            url
+    # fragment 제거
+    parsed = parsed._replace(fragment="")
+
+    # Naver에서 간혹 ?iid& 형태가 나오므로
+    # query 마지막의 &만 제거
+    query = parsed.query.rstrip("&")
+    parsed = parsed._replace(query=query)
+
+    cleaned = parsed.geturl()
+
+    # 마지막 / 제거
+    if cleaned.endswith("/"):
+        cleaned = cleaned[:-1]
+
+    return cleaned
+
+
+# ============================================================
+# 페이지 가져오기
+# ============================================================
+
+def fetch_page(url):
+    """
+    HTTP GET.
+    """
+
+    try:
+        response = session.get(
+            url,
+            timeout=HTTP_TIMEOUT,
+            allow_redirects=True,
         )
 
-        if match:
-            url = match.group(1)
+        print(
+            f"   HTTP {response.status_code}: "
+            f"{response.url}"
+        )
 
-    # Naver 모바일 URL 정규화
-    url = url.replace(
-        "https://m.news.naver.com",
-        "https://n.news.naver.com"
-    )
+        response.raise_for_status()
 
-    return url
+        return response.text
+
+    except requests.RequestException as e:
+        print(
+            f"   HTTP 요청 실패: {e}"
+        )
+
+        return None
 
 
-def fetch_page(url, timeout=30):
+# ============================================================
+# Firestore 중복 확인
+# ============================================================
+
+def is_already_collected(db, url):
     """
-    웹 페이지 요청.
+    Firestore news-summary 컬렉션에
+    동일 URL이 있는지 확인.
     """
 
     url = clean_url(url)
 
-    print(f"   🌐 요청: {url}")
+    if not url:
+        return True
 
-    response = session.get(
-        url,
-        timeout=timeout,
-        allow_redirects=True,
-    )
+    try:
+        docs = (
+            db.collection("news-summary")
+            .where(
+                filter=FieldFilter(
+                    "url",
+                    "==",
+                    url,
+                )
+            )
+            .limit(1)
+            .stream()
+        )
 
-    print(
-        f"   HTTP {response.status_code} | "
-        f"최종 URL: {response.url} | "
-        f"HTML: {len(response.text):,} bytes"
-    )
+        for _ in docs:
+            return True
 
-    response.raise_for_status()
+        return False
 
-    return response.text, response.url
+    except Exception as e:
+        print(
+            f"   Firestore 중복 확인 오류: {e}"
+        )
+
+        # Firestore 확인 자체가 실패하면
+        # 중복 저장을 방지하기 위해 True 처리
+        return True
 
 
 # ============================================================
-# Naver URL 필터
+# Naver 기사 URL 판별
 # ============================================================
 
 def is_naver_article_url(url):
     """
-    실제 네이버 뉴스 기사 URL만 허용한다.
-
-    허용:
-      /article/092/000...
-      /mnews/article/...
+    Naver 뉴스 실제 기사 URL만 통과.
 
     제외:
-      /article/comment/...
+    - 댓글 URL
+    - 기타 페이지
     """
 
     if not url:
@@ -224,173 +361,96 @@ def is_naver_article_url(url):
     }:
         return False
 
-    # 댓글 URL은 반드시 제외
-    if "/article/comment/" in parsed.path:
+    path = parsed.path
+
+    # 댓글 페이지 제외
+    if "/article/comment/" in path:
         return False
 
-    # 실제 기사 URL
-    if "/article/" in parsed.path:
+    # 일반 기사
+    if "/article/" in path:
         return True
 
-    if "/mnews/article/" in parsed.path:
+    # 구형 /mnews/article/
+    if "/mnews/article/" in path:
         return True
 
     return False
 
 
 # ============================================================
-# Firestore 중복 확인
+# Naver 이슈 페이지 기사 링크 추출
 # ============================================================
 
-def is_already_collected(url):
+def extract_naver_issue_links(html, issue_url):
     """
-    URL이 이미 news-summary 컬렉션에 있는지 확인한다.
+    Naver 이슈 페이지에서 실제 기사 URL 추출.
     """
 
-    url = clean_url(url)
-
-    query = (
-        db.collection("news-summary")
-        .where(
-            filter=FieldFilter(
-                "url",
-                "==",
-                url,
-            )
-        )
-        .limit(1)
-    )
-
-    docs = list(query.stream())
-
-    return len(docs) > 0
-
-
-# ============================================================
-# Naver 이슈 페이지에서 기사 URL 추출
-# ============================================================
-
-def extract_naver_issue_links(issue_url):
-    print()
-    print("🔎 네이버 이슈 페이지 분석")
-
-    html, final_url = fetch_page(issue_url)
+    if not html:
+        return []
 
     soup = BeautifulSoup(
         html,
-        "html.parser"
+        "html.parser",
     )
 
-    found_urls = []
-
-    # --------------------------------------------------------
-    # HTML <a> 태그 분석
-    # --------------------------------------------------------
+    links = []
+    seen = set()
 
     for a in soup.find_all("a", href=True):
 
-        href = a.get("href", "").strip()
+        href = a.get("href")
 
         if not href:
             continue
 
-        href = clean_url(
-            urljoin(final_url, href)
+        href = urljoin(
+            issue_url,
+            href,
         )
 
-        if is_naver_article_url(href):
-            found_urls.append(href)
+        href = clean_url(href)
 
-    # --------------------------------------------------------
-    # Raw HTML에서 URL 패턴 추가 탐색
-    # --------------------------------------------------------
-
-    raw_urls = re.findall(
-        r'https?://(?:n\.news\.naver\.com|news\.naver\.com)'
-        r'/[^"\'>\s]+',
-        html,
-    )
-
-    for url in raw_urls:
-
-        url = clean_url(url)
-
-        if is_naver_article_url(url):
-            found_urls.append(url)
-
-    # --------------------------------------------------------
-    # 중복 제거
-    # --------------------------------------------------------
-
-    unique_urls = []
-
-    seen = set()
-
-    for url in found_urls:
-
-        url = clean_url(url)
-
-        if not is_naver_article_url(url):
+        if not is_naver_article_url(href):
             continue
 
-        # query parameter에서 iid 등은 유지하되
-        # 동일 기사 URL은 중복 제거
-        parsed = urlparse(url)
+        if href in seen:
+            continue
 
-        normalized = urlunparse(
-            (
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
-                "",
-                parsed.query,
-                "",
-            )
-        )
+        seen.add(href)
 
-        if normalized not in seen:
-            seen.add(normalized)
-            unique_urls.append(normalized)
+        links.append(href)
 
-    print(
-        f"   ✅ 발견한 Naver 기사 URL: "
-        f"{len(unique_urls)}개"
-    )
-
-    for i, url in enumerate(
-        unique_urls[:10],
-        start=1
-    ):
-        print(f"      {i}. {url}")
-
-    return unique_urls
+    return links
 
 
 # ============================================================
-# Naver Search API fallback
+# Naver News API fallback
 # ============================================================
 
 def search_naver_news_api(query, display=20):
     """
-    Naver 뉴스 검색 API fallback.
-    이슈 페이지에서 URL을 충분히 가져오지 못하는 경우 사용한다.
+    Naver 검색 API fallback.
+
+    NAVER_CLIENT_ID / NAVER_CLIENT_SECRET이 없는 경우
+    빈 리스트 반환.
     """
 
-    client_id = os.getenv("NAVER_CLIENT_ID")
-    client_secret = os.getenv("NAVER_CLIENT_SECRET")
-
-    if not client_id or not client_secret:
-        print(
-            "   ⚠️ NAVER_CLIENT_ID / "
-            "NAVER_CLIENT_SECRET이 없어 API 검색을 건너뜁니다."
-        )
-        return []
-
-    print(
-        f"   🔎 Naver Search API 검색: {query}"
+    client_id = os.getenv(
+        "NAVER_CLIENT_ID"
     )
 
-    api_url = "https://openapi.naver.com/v1/search/news.json"
+    client_secret = os.getenv(
+        "NAVER_CLIENT_SECRET"
+    )
+
+    if not client_id or not client_secret:
+        return []
+
+    api_url = (
+        "https://openapi.naver.com/v1/search/news.json"
+    )
 
     headers = {
         "X-Naver-Client-Id": client_id,
@@ -403,86 +463,97 @@ def search_naver_news_api(query, display=20):
         "sort": "date",
     }
 
-    response = session.get(
-        api_url,
-        headers=headers,
-        params=params,
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    results = []
-
-    for item in data.get("items", []):
-
-        link = clean_url(
-            item.get("originallink")
-            or item.get("link")
-            or ""
+    try:
+        response = requests.get(
+            api_url,
+            headers=headers,
+            params=params,
+            timeout=HTTP_TIMEOUT,
         )
 
-        if is_naver_article_url(link):
+        response.raise_for_status()
+
+        data = response.json()
+
+        results = []
+
+        for item in data.get("items", []):
+            link = item.get("link")
+
+            if not link:
+                continue
+
+            link = clean_url(link)
+
+            if not is_naver_article_url(link):
+                continue
+
             results.append(link)
 
-    return results
+        return results
+
+    except Exception as e:
+        print(
+            f"   Naver API fallback 실패: {e}"
+        )
+
+        return []
 
 
 # ============================================================
 # Naver 기사 본문 추출
 # ============================================================
 
-def extract_article(url):
-    print()
-    print("📄 기사 본문 추출")
-    print(f"   URL: {url}")
+def extract_naver_article(html):
+    """
+    Naver 뉴스 기사 제목/본문 추출.
+    """
 
-    html, final_url = fetch_page(url)
+    if not html:
+        return None, None
 
     soup = BeautifulSoup(
         html,
-        "html.parser"
+        "html.parser",
     )
 
-    # --------------------------------------------------------
     # 제목
-    # --------------------------------------------------------
-
-    title = ""
+    title = None
 
     title_selectors = [
         "h2#title_area",
         "h2.media_end_head_headline",
-        "h1#title_area",
-        "h1",
+        "h2#title_area",
+        "meta[property='og:title']",
+        "title",
     ]
 
     for selector in title_selectors:
 
         element = soup.select_one(selector)
 
-        if element:
+        if not element:
+            continue
+
+        if element.name == "meta":
+            title = element.get("content")
+        else:
             title = element.get_text(
                 " ",
-                strip=True
+                strip=True,
             )
 
-            if title:
-                break
+        if title:
+            break
 
-    # --------------------------------------------------------
     # 본문
-    # --------------------------------------------------------
-
-    body = ""
+    body = None
 
     body_selectors = [
+        "#dic_area",
         "article#dic_area",
         "div#dic_area",
         "div._article_content",
-        "div.article_body",
         "article",
     ]
 
@@ -493,50 +564,49 @@ def extract_article(url):
         if not element:
             continue
 
-        # 불필요한 요소 제거
-        for tag in element.select(
-            "script, style, iframe, figure, "
-            "button, aside, nav"
-        ):
-            tag.decompose()
-
         text = element.get_text(
             "\n",
-            strip=True
+            strip=True,
         )
 
-        if len(text) > len(body):
+        if len(text) >= MIN_ARTICLE_LENGTH:
             body = text
+            break
 
-    # --------------------------------------------------------
-    # 불필요한 공백 정리
-    # --------------------------------------------------------
+    if not body:
+        # 최후 fallback
+        paragraphs = []
 
-    body = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        body
-    )
+        for p in soup.find_all("p"):
+            text = p.get_text(
+                " ",
+                strip=True,
+            )
 
-    body = re.sub(
-        r"[ \t]{2,}",
-        " ",
-        body
-    )
+            if len(text) >= 20:
+                paragraphs.append(text)
 
-    print(f"   제목: {title}")
-    print(f"   본문 길이: {len(body):,}자")
+        body = "\n".join(paragraphs)
 
-    if not title:
-        raise RuntimeError(
-            "기사 제목을 찾지 못했습니다."
+    if title:
+        title = re.sub(
+            r"\s+",
+            " ",
+            title,
+        ).strip()
+
+    if body:
+        body = re.sub(
+            r"\n{3,}",
+            "\n\n",
+            body,
         )
 
-    if len(body) < MIN_ARTICLE_LENGTH:
-        raise RuntimeError(
-            f"기사 본문이 너무 짧습니다. "
-            f"현재 {len(body)}자"
-        )
+        body = re.sub(
+            r"[ \t]+",
+            " ",
+            body,
+        ).strip()
 
     return title, body
 
@@ -545,181 +615,518 @@ def extract_article(url):
 # SemiEngineering 링크 추출
 # ============================================================
 
-def extract_semiengineering_links():
-    print()
-    print("📰 SemiEngineering 수집 시작")
-    print()
-    print("=" * 60)
+def extract_semiengineering_links(html):
+    """
+    SemiEngineering author 페이지에서
+    기사 링크 추출.
+    """
 
-    html, final_url = fetch_page(
-        SEMIENGINEERING_AUTHOR_URL
-    )
+    if not html:
+        return []
 
     soup = BeautifulSoup(
         html,
-        "html.parser"
+        "html.parser",
     )
 
-    results = []
+    links = []
+    seen = set()
 
     for a in soup.find_all("a", href=True):
 
-        title = a.get_text(
-            " ",
-            strip=True
-        )
+        href = a.get("href")
 
-        href = clean_url(
-            urljoin(
-                final_url,
-                a.get("href")
-            )
-        )
-
-        if (
-            "Chip Industry Week In Review"
-            in title
-        ):
-            results.append(
-                {
-                    "title": title,
-                    "url": href,
-                }
-            )
-
-    # 중복 제거
-    unique = []
-
-    seen = set()
-
-    for item in results:
-
-        url = item["url"]
-
-        if url in seen:
+        if not href:
             continue
 
-        seen.add(url)
-        unique.append(item)
+        href = urljoin(
+            SEMIENGINEERING_AUTHOR_URL,
+            href,
+        )
 
-    print(
-        f"   ✅ 'Chip Industry Week In Review' "
-        f"후보: {len(unique)}개"
+        href = clean_url(href)
+
+        parsed = urlparse(href)
+
+        if parsed.netloc not in {
+            "semiengineering.com",
+            "www.semiengineering.com",
+        }:
+            continue
+
+        path = parsed.path.lower()
+
+        if not path or path == "/":
+            continue
+
+        # author 페이지 자체 제외
+        if "/author/" in path:
+            continue
+
+        # category/tag/search 등 제외
+        excluded_paths = [
+            "/category/",
+            "/tag/",
+            "/search/",
+            "/page/",
+            "/contact/",
+            "/about/",
+        ]
+
+        if any(
+            path.startswith(prefix)
+            for prefix in excluded_paths
+        ):
+            continue
+
+        if href in seen:
+            continue
+
+        seen.add(href)
+
+        links.append(href)
+
+    return links
+
+
+# ============================================================
+# 기사 본문 일반 추출
+# ============================================================
+
+def extract_generic_article(html):
+    """
+    SemiEngineering 등 일반 사이트 기사 본문 추출.
+    """
+
+    if not html:
+        return None, None
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
     )
 
-    for i, item in enumerate(
-        unique[:10],
-        start=1
-    ):
-        print(f"      {i}. {item['title']}")
-        print(f"         {item['url']}")
+    # 제목
+    title = None
 
-    return unique
+    title_selectors = [
+        "h1.entry-title",
+        "h1.post-title",
+        "article h1",
+        "h1",
+        "meta[property='og:title']",
+        "title",
+    ]
+
+    for selector in title_selectors:
+
+        element = soup.select_one(selector)
+
+        if not element:
+            continue
+
+        if element.name == "meta":
+            title = element.get("content")
+        else:
+            title = element.get_text(
+                " ",
+                strip=True,
+            )
+
+        if title:
+            break
+
+    # 본문
+    article = None
+
+    body_selectors = [
+        "article",
+        ".entry-content",
+        ".post-content",
+        ".article-content",
+        ".td-post-content",
+        "main",
+    ]
+
+    for selector in body_selectors:
+
+        element = soup.select_one(selector)
+
+        if not element:
+            continue
+
+        text = element.get_text(
+            "\n",
+            strip=True,
+        )
+
+        if len(text) >= MIN_ARTICLE_LENGTH:
+            article = text
+            break
+
+    if not article:
+        paragraphs = []
+
+        for p in soup.find_all("p"):
+
+            text = p.get_text(
+                " ",
+                strip=True,
+            )
+
+            if len(text) >= 20:
+                paragraphs.append(text)
+
+        article = "\n".join(paragraphs)
+
+    if title:
+        title = re.sub(
+            r"\s+",
+            " ",
+            title,
+        ).strip()
+
+    if article:
+        article = re.sub(
+            r"\n{3,}",
+            "\n\n",
+            article,
+        )
+
+        article = re.sub(
+            r"[ \t]+",
+            " ",
+            article,
+        ).strip()
+
+    return title, article
+
+
+# ============================================================
+# Gemini 오류 문자열 분석
+# ============================================================
+
+def get_gemini_error_text(error):
+    """
+    Gemini 예외를 문자열로 안전하게 변환.
+    """
+
+    try:
+        return str(error)
+    except Exception:
+        return repr(error)
+
+
+def is_quota_exceeded_error(error):
+    """
+    429 중에서도 일일 quota / 무료 quota 초과인지 판별.
+    """
+
+    text = get_gemini_error_text(error).lower()
+
+    quota_keywords = [
+        "quota exceeded",
+        "quota_exceeded",
+        "daily quota",
+        "free_tier_requests",
+        "per day",
+        "daily limit",
+        "exceeded your current quota",
+        "resource_exhausted",
+    ]
+
+    return any(
+        keyword in text
+        for keyword in quota_keywords
+    )
+
+
+def is_rate_limit_error(error):
+    """
+    짧은 시간 내 요청량 제한인지 판별.
+    """
+
+    text = get_gemini_error_text(error).lower()
+
+    rate_keywords = [
+        "rate limit",
+        "rate_limit_exceeded",
+        "too many requests",
+        "too_many_requests",
+        "requests per minute",
+        "rpm",
+        "requests per second",
+    ]
+
+    return any(
+        keyword in text
+        for keyword in rate_keywords
+    )
+
+
+def is_503_error(error):
+    """
+    Gemini 503 / UNAVAILABLE 여부.
+    """
+
+    text = get_gemini_error_text(error).lower()
+
+    return (
+        "503" in text
+        or "unavailable" in text
+        or "service unavailable" in text
+    )
+
+
+# ============================================================
+# Gemini API 호출
+# ============================================================
+
+def call_gemini_once(client, prompt):
+    """
+    Gemini API를 딱 한 번 호출.
+
+    이 함수에서 호출 횟수를 전역으로 관리한다.
+    """
+
+    global gemini_calls_used
+    global gemini_quota_exhausted
+
+    if gemini_quota_exhausted:
+        raise GeminiQuotaExceeded(
+            "이번 실행에서는 Gemini quota가 이미 "
+            "초과되어 추가 호출을 하지 않습니다."
+        )
+
+    if gemini_calls_used >= MAX_GEMINI_CALLS_PER_RUN:
+        raise GeminiCallBudgetExceeded(
+            f"이번 실행의 Gemini 호출 제한 "
+            f"{MAX_GEMINI_CALLS_PER_RUN}회에 도달했습니다."
+        )
+
+    # 실제 API 호출 직전에 카운트
+    gemini_calls_used += 1
+
+    print(
+        f"   Gemini API 호출 "
+        f"{gemini_calls_used}/"
+        f"{MAX_GEMINI_CALLS_PER_RUN}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+
+        return response
+
+    except Exception as e:
+
+        # ----------------------------------------------------
+        # 429 quota 초과
+        # ----------------------------------------------------
+        if is_quota_exceeded_error(e):
+
+            gemini_quota_exhausted = True
+
+            print(
+                "   ❌ Gemini 429 quota 초과 감지"
+            )
+
+            print(
+                "   ❌ 이번 실행의 Gemini 호출을 "
+                "즉시 중단합니다."
+            )
+
+            raise GeminiQuotaExceeded(
+                get_gemini_error_text(e)
+            ) from e
+
+        # ----------------------------------------------------
+        # 429 단기 rate limit
+        # ----------------------------------------------------
+        if is_rate_limit_error(e):
+
+            print(
+                "   ⚠️ Gemini 429 단기 rate limit 감지"
+            )
+
+            raise GeminiTemporaryError(
+                get_gemini_error_text(e)
+            ) from e
+
+        # ----------------------------------------------------
+        # 503
+        # ----------------------------------------------------
+        if is_503_error(e):
+
+            print(
+                "   ⚠️ Gemini 503 UNAVAILABLE 감지"
+            )
+
+            raise GeminiTemporaryError(
+                get_gemini_error_text(e)
+            ) from e
+
+        # ----------------------------------------------------
+        # 기타 오류
+        # ----------------------------------------------------
+        raise
 
 
 # ============================================================
 # Gemini 요약
 # ============================================================
 
-def summarize_with_gemini(title, body):
+def summarize_with_gemini(client, title, body):
     """
-    Gemini 503 / 일시적 서버 오류 발생 시
-    최대 3회 재시도한다.
+    기사 본문을 한국어로 요약.
+
+    출력:
+    - 요약 3줄
+    - 핵심 인사이트 1줄
+
+    429 quota:
+        즉시 중단
+
+    429 단기 rate limit:
+        제한적으로 재시도
+
+    503:
+        제한적으로 재시도
     """
+
+    if not title:
+        title = "제목 없음"
+
+    if not body:
+        raise ValueError(
+            "본문이 없습니다."
+        )
+
+    # 지나치게 긴 본문은 일정 길이까지만 전달
+    #
+    # 기사 전체를 무조건 전송하지 않고
+    # 요약에 필요한 충분한 분량만 전달한다.
+    max_body_chars = 12000
+
+    body_for_prompt = body[:max_body_chars]
 
     prompt = f"""
-다음 뉴스 기사를 한국어로 요약해줘.
+다음 뉴스 기사를 한국어로 요약해 주세요.
 
-제목:
+[기사 제목]
 {title}
 
-본문:
-{body}
+[기사 본문]
+{body_for_prompt}
 
-다음 형식을 정확히 지켜줘.
+반드시 아래 형식으로만 작성하세요.
 
-[요약 1]
-핵심 내용을 한 문장으로 작성
+요약:
+1. 첫 번째 핵심 내용
+2. 두 번째 핵심 내용
+3. 세 번째 핵심 내용
 
-[요약 2]
-중요한 내용을 한 문장으로 작성
+인사이트:
+한 줄로 작성하되, 이 기사가 반도체/AI 산업 또는 관련 기업에 어떤 의미가 있는지 설명하세요.
 
-[요약 3]
-향후 영향이나 의미를 한 문장으로 작성
-
-[인사이트]
-이 뉴스가 반도체/AI 산업에 어떤 의미가 있는지 한 문장으로 작성
+주의:
+- 기사에 없는 사실을 만들어내지 마세요.
+- 과도한 추측은 하지 마세요.
+- 각 요약은 한 문장 중심으로 간결하게 작성하세요.
+- 반드시 한국어로 작성하세요.
 """
 
-    max_retries = 3
+    last_error = None
 
-    for attempt in range(
-        1,
-        max_retries + 1
-    ):
+    # 총 시도 횟수는 API budget 안에서만 수행
+    #
+    # 503 / 단기 429 재시도도 각각 API 호출로 계산됨.
+    max_attempts = 1 + MAX_GEMINI_503_RETRIES
+
+    for attempt in range(1, max_attempts + 1):
+
+        print(
+            f"   Gemini 요약 시도 "
+            f"{attempt}/{max_attempts}"
+        )
 
         try:
-
-            print(
-                f"   🤖 Gemini 요약 시도 "
-                f"{attempt}/{max_retries}"
+            response = call_gemini_once(
+                client,
+                prompt,
             )
 
-            response = (
-                gemini_client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
+            text = getattr(
+                response,
+                "text",
+                None,
+            )
+
+            if not text:
+                raise RuntimeError(
+                    "Gemini 응답에 text가 없습니다."
                 )
-            )
 
-            if not response.text:
+            text = text.strip()
+
+            if not text:
                 raise RuntimeError(
                     "Gemini 응답이 비어 있습니다."
                 )
 
-            print("   ✅ Gemini 요약 완료")
+            return text
 
-            return response.text.strip()
+        except GeminiQuotaExceeded:
+            # 절대 재시도하지 않는다.
+            raise
+
+        except GeminiCallBudgetExceeded:
+            # 전체 실행 예산 초과
+            raise
+
+        except GeminiTemporaryError as e:
+
+            last_error = e
+
+            # 마지막 시도면 종료
+            if attempt >= max_attempts:
+                break
+
+            # 503 / rate limit에 대해서만 재시도
+            delay_index = min(
+                attempt - 1,
+                len(GEMINI_RETRY_DELAYS) - 1,
+            )
+
+            delay = GEMINI_RETRY_DELAYS[
+                delay_index
+            ]
+
+            print(
+                f"   ⏳ Gemini 재시도 전 "
+                f"{delay}초 대기"
+            )
+
+            time.sleep(delay)
+
+            continue
 
         except Exception as e:
 
-            error_text = str(e)
+            # 알 수 없는 오류는 재시도하지 않는다.
+            last_error = e
 
             print(
-                f"   ⚠️ Gemini 오류 "
-                f"({attempt}/{max_retries}): "
-                f"{error_text}"
+                f"   ❌ Gemini 오류: {e}"
             )
 
-            # ------------------------------------------------
-            # 503 / UNAVAILABLE은 일시적 오류로 보고 재시도
-            # ------------------------------------------------
+            break
 
-            if (
-                "503" in error_text
-                or "UNAVAILABLE" in error_text
-            ):
-
-                if attempt < max_retries:
-
-                    wait_seconds = attempt * 10
-
-                    print(
-                        f"   ⏳ Gemini 서버가 바쁩니다. "
-                        f"{wait_seconds}초 후 재시도합니다."
-                    )
-
-                    time.sleep(
-                        wait_seconds
-                    )
-
-                    continue
-
-            # ------------------------------------------------
-            # 다른 오류 또는 재시도 횟수 초과
-            # ------------------------------------------------
-
-            raise
+    if last_error:
+        raise last_error
 
     raise RuntimeError(
         "Gemini 요약에 실패했습니다."
@@ -731,35 +1138,36 @@ def summarize_with_gemini(title, body):
 # ============================================================
 
 def save_article(
+    db,
     category,
     title,
     url,
     summary,
+    source,
 ):
     """
-    news-summary 컬렉션에 저장한다.
+    news-summary 컬렉션에 기사 저장.
     """
 
     url = clean_url(url)
-
-    doc_ref = db.collection(
-        "news-summary"
-    ).document()
 
     data = {
         "category": category,
         "title": title,
         "url": url,
         "summary": summary,
+        "source": source,
         "bookmarked": False,
         "createdAt": firestore.SERVER_TIMESTAMP,
         "collectedAt": firestore.SERVER_TIMESTAMP,
     }
 
-    doc_ref.set(data)
+    db.collection(
+        "news-summary"
+    ).add(data)
 
     print(
-        f"   💾 Firestore 저장 완료: {title}"
+        "   ✅ Firestore 저장 완료"
     )
 
 
@@ -768,298 +1176,516 @@ def save_article(
 # ============================================================
 
 def collect_naver_category(
-    category_name,
-    issue_url,
-    search_query,
+    db,
+    gemini_client,
+    issue,
 ):
+    """
+    Naver 이슈 카테고리 하나 수집.
+
+    중요한 변경점:
+
+    기존:
+        성공 5개를 채울 때까지
+        수십~수백 개 URL을 순회할 수 있음.
+
+    현재:
+        새로운 기사 최대 5개까지만 실제 처리.
+    """
+
+    global gemini_quota_exhausted
+
+    category_name = issue["name"]
+    issue_url = issue["url"]
+    query = issue["query"]
+
     print()
-    print("=" * 60)
+    print("=" * 70)
     print(
-        f"🔥 [{category_name}] "
-        f"네이버 뉴스 수집 시작"
+        f"[{category_name}] 수집 시작"
     )
+    print("=" * 70)
+
+    html = fetch_page(issue_url)
+
+    links = extract_naver_issue_links(
+        html,
+        issue_url,
+    )
+
     print(
-        f"   URL: {issue_url}"
+        f"   Naver 이슈 페이지에서 "
+        f"{len(links)}개 기사 후보 발견"
     )
-    print("=" * 60)
 
-    try:
+    # 페이지 자체에서 링크를 못 찾은 경우
+    # Naver API fallback
+    if not links:
 
-        article_urls = extract_naver_issue_links(
-            issue_url
+        print(
+            "   ⚠️ 이슈 페이지에서 기사를 찾지 못했습니다."
         )
 
-        # ----------------------------------------------------
-        # URL이 충분하지 않으면 Search API fallback
-        # ----------------------------------------------------
+        print(
+            "   Naver News API fallback 시도"
+        )
 
-        if len(article_urls) == 0:
+        links = search_naver_news_api(
+            query,
+            display=20,
+        )
 
-            print(
-                "   ⚠️ 이슈 페이지에서 기사 URL을 찾지 못했습니다."
-            )
+        print(
+            f"   API에서 "
+            f"{len(links)}개 기사 후보 발견"
+        )
 
-            api_urls = search_naver_news_api(
-                search_query
-            )
+    if not links:
+        print(
+            "   ❌ 수집 가능한 기사가 없습니다."
+        )
+        return 0
 
-            article_urls.extend(
-                api_urls
-            )
+    saved_count = 0
+    attempted_new_count = 0
 
-        # ----------------------------------------------------
-        # 중복 제거
-        # ----------------------------------------------------
-
-        unique_urls = []
-
-        seen = set()
-
-        for url in article_urls:
-
-            url = clean_url(url)
-
-            if not is_naver_article_url(url):
-                continue
-
-            if url in seen:
-                continue
-
-            seen.add(url)
-
-            unique_urls.append(url)
-
-        article_urls = unique_urls
+    for index, url in enumerate(
+        links,
+        start=1,
+    ):
 
         print()
         print(
-            f"   📌 최종 처리 대상 URL: "
-            f"{len(article_urls)}개"
+            f"--- [{category_name}] "
+            f"{index}/{len(links)} ---"
         )
 
-        saved_count = 0
+        print(
+            f"URL: {url}"
+        )
 
         # ----------------------------------------------------
-        # 기사 처리
+        # 이번 실행에서 Gemini quota가 소진되었다면
+        # 더 이상 기사 처리하지 않는다.
         # ----------------------------------------------------
+        if gemini_quota_exhausted:
 
-        for index, url in enumerate(
-            article_urls,
-            start=1
+            print(
+                "   🛑 Gemini quota 초과 상태이므로 "
+                "카테고리 수집 중단"
+            )
+
+            break
+
+        # ----------------------------------------------------
+        # 저장 성공 개수 제한
+        # ----------------------------------------------------
+        if saved_count >= MAX_ARTICLES_PER_CATEGORY:
+
+            print(
+                f"   📌 카테고리별 최대 "
+                f"{MAX_ARTICLES_PER_CATEGORY}개 "
+                "저장 완료"
+            )
+
+            break
+
+        # ----------------------------------------------------
+        # 새 기사 처리 시도 횟수 제한
+        #
+        # 중요:
+        # 146개 URL을 끝까지 훑지 않는다.
+        # ----------------------------------------------------
+        if (
+            attempted_new_count
+            >= MAX_NEW_ARTICLES_PER_CATEGORY
         ):
 
-            print()
             print(
-                f"--- [{category_name}] "
-                f"{index}/{len(article_urls)} ---"
+                f"   📌 새 기사 처리 최대 "
+                f"{MAX_NEW_ARTICLES_PER_CATEGORY}개 "
+                "도달"
             )
 
-            # 이미 저장된 기사인지 확인
-            try:
+            break
 
-                if is_already_collected(url):
+        url = clean_url(url)
 
-                    print(
-                        "   ⏭️ 이미 수집된 기사 → 스킵"
-                    )
+        if not url:
+            continue
 
-                    continue
+        # ----------------------------------------------------
+        # Firestore 중복 확인
+        # ----------------------------------------------------
+        if is_already_collected(
+            db,
+            url,
+        ):
 
-            except Exception as e:
+            print(
+                "   ⏭️ 이미 수집된 기사 → 건너뜀"
+            )
 
-                print(
-                    f"   ⚠️ Firestore 중복 확인 실패: {e}"
-                )
+            continue
 
-                continue
+        # 여기부터는 실제 신규 기사 처리
+        attempted_new_count += 1
 
-            try:
+        # ----------------------------------------------------
+        # 기사 페이지 가져오기
+        # ----------------------------------------------------
+        article_html = fetch_page(url)
 
-                title, body = extract_article(
-                    url
-                )
+        if not article_html:
+            print(
+                "   ❌ 기사 HTML을 가져오지 못했습니다."
+            )
+            continue
 
-                print()
-                print("🤖 Gemini 요약 시작")
-
-                summary = summarize_with_gemini(
-                    title,
-                    body,
-                )
-
-                save_article(
-                    category=category_name,
-                    title=title,
-                    url=url,
-                    summary=summary,
-                )
-
-                saved_count += 1
-
-            except Exception as e:
-
-                print()
-                print(
-                    f"   ❌ 기사 처리 실패: {e}"
-                )
-
-                # 한 기사 실패 때문에
-                # 다음 기사까지 중단하지 않는다.
-                continue
-
-            # API 서버에 너무 빠르게 요청하지 않도록
-            time.sleep(2)
-
-            # 이번 실행에서 너무 많은 기사 저장 방지
-            if saved_count >= MAX_ARTICLES_PER_CATEGORY:
-                print()
-                print(
-                    f"   📌 카테고리별 최대 "
-                    f"{MAX_ARTICLES_PER_CATEGORY}개 "
-                    "저장 완료"
-                    )
-                break
-
-        print()
-        print(
-            f"✅ [{category_name}] "
-            f"수집 종료 - 새로 저장: "
-            f"{saved_count}개"
-        )
-
-        return saved_count
-
-    except Exception as e:
-
-        print()
-        print(
-            f"❌ [{category_name}] "
-            f"처리 실패"
+        # ----------------------------------------------------
+        # 기사 추출
+        # ----------------------------------------------------
+        title, body = extract_naver_article(
+            article_html
         )
 
         print(
-            f"   오류: {e}"
+            f"   제목: {title}"
         )
 
-        return 0
+        body_length = len(body or "")
+
+        print(
+            f"   본문 길이: "
+            f"{body_length}자"
+        )
+
+        if not title:
+            print(
+                "   ❌ 제목 추출 실패"
+            )
+            continue
+
+        if not body:
+            print(
+                "   ❌ 본문 추출 실패"
+            )
+            continue
+
+        if body_length < MIN_ARTICLE_LENGTH:
+            print(
+                f"   ⏭️ 본문이 너무 짧음 "
+                f"({MIN_ARTICLE_LENGTH}자 미만)"
+            )
+            continue
+
+        # ----------------------------------------------------
+        # Gemini 요약
+        # ----------------------------------------------------
+        print(
+            "   Gemini 요약 시작"
+        )
+
+        try:
+            summary = summarize_with_gemini(
+                gemini_client,
+                title,
+                body,
+            )
+
+        except GeminiQuotaExceeded:
+
+            print(
+                "   🛑 Gemini quota 초과."
+            )
+
+            print(
+                "   🛑 이후 기사에서는 "
+                "Gemini를 호출하지 않습니다."
+            )
+
+            break
+
+        except GeminiCallBudgetExceeded:
+
+            print(
+                "   🛑 이번 실행의 Gemini 호출 "
+                "예산에 도달했습니다."
+            )
+
+            break
+
+        except Exception as e:
+
+            print(
+                f"   ❌ Gemini 요약 실패: {e}"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Firestore 저장
+        # ----------------------------------------------------
+        try:
+
+            save_article(
+                db=db,
+                category=category_name,
+                title=title,
+                url=url,
+                summary=summary,
+                source="Naver",
+            )
+
+            saved_count += 1
+
+        except Exception as e:
+
+            print(
+                f"   ❌ Firestore 저장 실패: {e}"
+            )
+
+            continue
+
+    print()
+    print(
+        f"[{category_name}] "
+        f"수집 완료: "
+        f"{saved_count}개 저장"
+    )
+
+    return saved_count
 
 
 # ============================================================
 # SemiEngineering 수집
 # ============================================================
 
-def collect_semiengineering():
+def collect_semiengineering(
+    db,
+    gemini_client,
+):
+    """
+    SemiEngineering author 페이지 수집.
+
+    페이지에서 최신 기사 후보를 찾고
+    신규 기사 중 첫 번째 처리 가능한 기사만 저장.
+    """
+
+    global gemini_quota_exhausted
+
     print()
-    print("=" * 60)
-    print("📰 SemiEngineering 수집 시작")
-    print("=" * 60)
+    print("=" * 70)
+    print("[SemiEngineering] 수집 시작")
+    print("=" * 70)
 
-    try:
+    if gemini_quota_exhausted:
 
-        candidates = (
-            extract_semiengineering_links()
+        print(
+            "   🛑 Gemini quota 초과 상태이므로 "
+            "SemiEngineering 수집을 건너뜁니다."
         )
 
-        if not candidates:
-            print(
-                "   ⚠️ 수집할 SemiEngineering "
-                "기사가 없습니다."
-            )
-            return 0
+        return 0
 
-        # 가장 최신 후보부터 확인
-        latest = candidates[0]
+    html = fetch_page(
+        SEMIENGINEERING_AUTHOR_URL
+    )
 
-        url = clean_url(
-            latest["url"]
+    links = extract_semiengineering_links(
+        html
+    )
+
+    print(
+        f"   기사 후보 "
+        f"{len(links)}개 발견"
+    )
+
+    if not links:
+        print(
+            "   ❌ SemiEngineering 기사를 찾지 못했습니다."
         )
+        return 0
+
+    attempted = 0
+
+    for index, url in enumerate(
+        links,
+        start=1,
+    ):
 
         print()
-        print("------------------------------------------------------------")
-        print("📌 SemiEngineering 기사")
-        print(url)
-        print("------------------------------------------------------------")
+        print(
+            f"--- [SemiEngineering] "
+            f"{index}/{len(links)} ---"
+        )
 
-        # 중복 확인
-        if is_already_collected(url):
+        print(
+            f"URL: {url}"
+        )
+
+        if gemini_quota_exhausted:
 
             print(
-                "   ⏭️ 이미 수집된 기사 → 스킵"
+                "   🛑 Gemini quota 초과 상태."
             )
 
-            return 0
+            break
+
+        # 신규 기사만 처리
+        if is_already_collected(
+            db,
+            url,
+        ):
+
+            print(
+                "   ⏭️ 이미 수집된 기사 → 건너뜀"
+            )
+
+            continue
+
+        # SemiEngineering에서는
+        # 너무 많은 후보를 계속 처리하지 않는다.
+        attempted += 1
+
+        if attempted > 1:
+
+            print(
+                "   📌 신규 기사 1개 처리 완료/시도. "
+                "이번 실행에서는 종료."
+            )
+
+            break
+
+        # ----------------------------------------------------
+        # 기사 가져오기
+        # ----------------------------------------------------
+        article_html = fetch_page(
+            url
+        )
+
+        if not article_html:
+            continue
+
+        title, body = extract_generic_article(
+            article_html
+        )
+
+        print(
+            f"   제목: {title}"
+        )
+
+        print(
+            f"   본문 길이: "
+            f"{len(body or '')}자"
+        )
+
+        if not title:
+            print(
+                "   ❌ 제목 추출 실패"
+            )
+            continue
+
+        if not body:
+            print(
+                "   ❌ 본문 추출 실패"
+            )
+            continue
+
+        if len(body) < MIN_ARTICLE_LENGTH:
+            print(
+                f"   ⏭️ 본문이 너무 짧음 "
+                f"({MIN_ARTICLE_LENGTH}자 미만)"
+            )
+            continue
+
+        # ----------------------------------------------------
+        # Gemini 요약
+        # ----------------------------------------------------
+        print(
+            "   Gemini 요약 시작"
+        )
 
         try:
 
-            title, body = extract_article(
-                url
-            )
-
-            print()
-            print("🤖 Gemini 요약 시작")
-
             summary = summarize_with_gemini(
+                gemini_client,
                 title,
                 body,
             )
 
+        except GeminiQuotaExceeded:
+
+            print(
+                "   🛑 Gemini quota 초과."
+            )
+
+            break
+
+        except GeminiCallBudgetExceeded:
+
+            print(
+                "   🛑 Gemini 호출 예산 초과."
+            )
+
+            break
+
+        except Exception as e:
+
+            print(
+                f"   ❌ Gemini 요약 실패: {e}"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Firestore 저장
+        # ----------------------------------------------------
+        try:
+
             save_article(
+                db=db,
                 category="SemiEngineering",
                 title=title,
                 url=url,
                 summary=summary,
+                source="SemiEngineering",
             )
 
             return 1
 
         except Exception as e:
 
-            print()
             print(
-                f"   ❌ [SemiEngineering] "
-                f"기사 처리 실패"
-            )
-
-            print(
-                f"   오류: {e}"
+                f"   ❌ Firestore 저장 실패: {e}"
             )
 
             return 0
 
-    except Exception as e:
-
-        print()
-        print(
-            "❌ [SemiEngineering] "
-            "수집 실패"
-        )
-
-        print(
-            f"   오류: {e}"
-        )
-
-        return 0
+    return 0
 
 
 # ============================================================
 # 오래된 기사 삭제
 # ============================================================
 
-def cleanup_old_articles():
-    print()
-    print("=" * 60)
-    print("🧹 오래된 기사 정리 시작")
-    print(
-        f"   기준: {DELETE_AFTER_DAYS}일 경과 "
-        "& 북마크 안 됨"
-    )
-    print("=" * 60)
+def cleanup_old_articles(db):
+    """
+    7일보다 오래된 기사 중
+    bookmarked == True가 아닌 기사 삭제.
 
-    cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(
-            days=DELETE_AFTER_DAYS
-        )
+    createdAt 또는 collectedAt을 사용.
+    """
+
+    print()
+    print("=" * 70)
+    print("[Cleanup] 오래된 기사 정리 시작")
+    print("=" * 70)
+
+    cutoff = datetime.now(
+        timezone.utc
+    ) - timedelta(
+        days=DELETE_AFTER_DAYS
     )
 
     deleted_count = 0
@@ -1070,9 +1696,9 @@ def cleanup_old_articles():
             db.collection("news-summary")
             .where(
                 filter=FieldFilter(
-                    "bookmarked",
-                    "==",
-                    False,
+                    "createdAt",
+                    "<",
+                    cutoff,
                 )
             )
             .stream()
@@ -1082,55 +1708,79 @@ def cleanup_old_articles():
 
             data = doc.to_dict()
 
-            created_at = (
-                data.get("createdAt")
-                or data.get("collectedAt")
+            bookmarked = data.get(
+                "bookmarked",
+                False,
             )
 
-            if not created_at:
+            # 북마크된 기사는 절대 삭제하지 않음
+            if bookmarked:
                 continue
 
-            try:
+            db.collection(
+                "news-summary"
+            ).document(
+                doc.id
+            ).delete()
 
-                # Firestore Timestamp
-                created_datetime = (
-                    created_at.replace(
-                        tzinfo=timezone.utc
-                    )
-                    if created_at.tzinfo is None
-                    else created_at
-                )
+            deleted_count += 1
 
-            except Exception:
-                continue
-
-            if created_datetime < cutoff:
-
-                doc.reference.delete()
-
-                deleted_count += 1
-
-                print(
-                    f"   🗑️ 삭제: "
-                    f"{data.get('title', '(제목 없음)')}"
-                )
-
-        print()
         print(
-            f"🧹 총 {deleted_count}개의 "
-            f"오래된 기사를 삭제했습니다."
+            f"   🗑️ 삭제 완료: "
+            f"{deleted_count}개"
         )
-
-        return deleted_count
 
     except Exception as e:
 
-        print()
         print(
-            f"❌ 오래된 기사 정리 실패: {e}"
+            f"   ❌ 오래된 기사 삭제 실패: {e}"
         )
 
-        return 0
+    return deleted_count
+
+
+# ============================================================
+# 실행 정보 출력
+# ============================================================
+
+def print_config():
+    print()
+    print("=" * 70)
+    print("뉴스 수집기 실행 설정")
+    print("=" * 70)
+
+    print(
+        f"Gemini 모델: {GEMINI_MODEL}"
+    )
+
+    print(
+        f"카테고리별 저장 최대: "
+        f"{MAX_ARTICLES_PER_CATEGORY}"
+    )
+
+    print(
+        f"카테고리별 신규 기사 처리 최대: "
+        f"{MAX_NEW_ARTICLES_PER_CATEGORY}"
+    )
+
+    print(
+        f"실행당 Gemini API 최대 호출: "
+        f"{MAX_GEMINI_CALLS_PER_RUN}"
+    )
+
+    print(
+        f"본문 최소 길이: "
+        f"{MIN_ARTICLE_LENGTH}"
+    )
+
+    print(
+        f"삭제 기준: "
+        f"{DELETE_AFTER_DAYS}일"
+    )
+
+    print(
+        "=" * 70
+    )
 
 
 # ============================================================
@@ -1139,85 +1789,219 @@ def cleanup_old_articles():
 
 def main():
 
+    global gemini_quota_exhausted
+
+    start_time = time.time()
+
     print()
     print("=" * 70)
-    print("🚀 뉴스 자동 수집 시스템 시작")
+    print("뉴스 수집기 시작")
+    print(
+        datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
     print("=" * 70)
 
-    print(
-        f"🕐 실행 시각: "
-        f"{now_kst().strftime('%Y-%m-%d %H:%M:%S')} KST"
-    )
+    print_config()
 
-    print(
-        f"🤖 Gemini 모델: {GEMINI_MODEL}"
-    )
+    # --------------------------------------------------------
+    # Firebase
+    # --------------------------------------------------------
+    try:
 
-    print("=" * 70)
+        db = init_firebase()
+
+        print(
+            "✅ Firebase 초기화 완료"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Firebase 초기화 실패: {e}"
+        )
+
+        raise
+
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
+    try:
+
+        gemini_client = init_gemini()
+
+        print(
+            "✅ Gemini 초기화 완료"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Gemini 초기화 실패: {e}"
+        )
+
+        raise
 
     total_saved = 0
 
     # --------------------------------------------------------
-    # Naver 뉴스
+    # Naver
     # --------------------------------------------------------
-
     for issue in NAVER_ISSUES:
 
-        saved = collect_naver_category(
-            category_name=issue["name"],
-            issue_url=issue["url"],
-            search_query=issue["query"],
-        )
+        # Gemini quota가 이미 소진되었다면
+        # 뒤의 카테고리에서는 Gemini 호출하지 않음.
+        if gemini_quota_exhausted:
 
-        total_saved += saved
+            print()
+            print(
+                "🛑 Gemini quota 초과 상태."
+            )
+
+            print(
+                "🛑 남은 Naver 카테고리는 "
+                "Gemini 호출 없이 건너뜁니다."
+            )
+
+            break
+
+        try:
+
+            saved = collect_naver_category(
+                db=db,
+                gemini_client=gemini_client,
+                issue=issue,
+            )
+
+            total_saved += saved
+
+        except GeminiQuotaExceeded:
+
+            gemini_quota_exhausted = True
+
+            print(
+                "🛑 Gemini quota 초과."
+            )
+
+            break
+
+        except GeminiCallBudgetExceeded:
+
+            print(
+                "🛑 Gemini 호출 예산 초과."
+            )
+
+            break
+
+        except Exception as e:
+
+            print(
+                f"❌ [{issue['name']}] "
+                f"수집 중 오류: {e}"
+            )
+
+            continue
 
     # --------------------------------------------------------
     # SemiEngineering
     # --------------------------------------------------------
+    if not gemini_quota_exhausted:
 
-    total_saved += (
-        collect_semiengineering()
-    )
+        try:
+
+            saved = collect_semiengineering(
+                db=db,
+                gemini_client=gemini_client,
+            )
+
+            total_saved += saved
+
+        except GeminiQuotaExceeded:
+
+            gemini_quota_exhausted = True
+
+            print(
+                "🛑 Gemini quota 초과."
+            )
+
+        except GeminiCallBudgetExceeded:
+
+            print(
+                "🛑 Gemini 호출 예산 초과."
+            )
+
+        except Exception as e:
+
+            print(
+                f"❌ SemiEngineering 수집 오류: {e}"
+            )
+
+    else:
+
+        print(
+            "🛑 Gemini quota 초과로 "
+            "SemiEngineering 수집을 건너뜁니다."
+        )
 
     # --------------------------------------------------------
-    # 오래된 기사 정리
+    # Cleanup
+    #
+    # Gemini quota와 관계없이 실행
     # --------------------------------------------------------
-
-    cleanup_old_articles()
-
-    # --------------------------------------------------------
-    # 종료
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print("🏁 뉴스 자동 수집 시스템 종료")
-    print("=" * 70)
-
-    print(
-        f"📥 이번 실행에서 새로 저장한 기사: "
-        f"{total_saved}개"
-    )
-
-    print("=" * 70)
-
-
-# ============================================================
-# 실행
-# ============================================================
-
-if __name__ == "__main__":
-
     try:
-        main()
+
+        cleanup_old_articles(db)
 
     except Exception as e:
 
-        print()
-        print("=" * 70)
-        print("💥 프로그램 치명적 오류")
-        print("=" * 70)
+        print(
+            f"❌ Cleanup 오류: {e}"
+        )
 
-        print(e)
+    # --------------------------------------------------------
+    # 결과
+    # --------------------------------------------------------
+    elapsed = time.time() - start_time
 
-        raise
+    print()
+    print("=" * 70)
+    print("뉴스 수집기 종료")
+    print("=" * 70)
+
+    print(
+        f"총 저장 기사: {total_saved}개"
+    )
+
+    print(
+        f"Gemini API 호출: "
+        f"{gemini_calls_used}/"
+        f"{MAX_GEMINI_CALLS_PER_RUN}"
+    )
+
+    if gemini_quota_exhausted:
+
+        print(
+            "Gemini 상태: "
+            "429 quota 초과로 중단"
+        )
+
+    else:
+
+        print(
+            "Gemini 상태: 정상"
+        )
+
+    print(
+        f"실행 시간: {elapsed:.1f}초"
+    )
+
+    print("=" * 70)
+
+
+# ============================================================
+# 프로그램 실행
+# ============================================================
+
+if __name__ == "__main__":
+    main()
