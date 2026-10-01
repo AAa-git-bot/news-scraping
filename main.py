@@ -26,8 +26,6 @@ else:
 db = firestore.client()
 
 gemini_api_key = os.environ.get("GEMINI_API_KEY")
-if not gemini_api_key:
-    print("⚠️ GEMINI_API_KEY가 등록되어 있지 않습니다!")
 client = genai.Client(api_key=gemini_api_key)
 
 HEADERS = {
@@ -75,17 +73,16 @@ def summarize_with_gemini(title: str, text: str, is_weekly_report: bool = False)
     return response.text
 
 # ==========================================
-# 3. 크롤링 로직 (모바일/PC 하이브리드 네이버 수집)
+# 3. 크롤링 로직 (네이버 뉴스 모바일 파싱 방식)
 # ==========================================
 def fetch_naver_issue_articles(issue_url: str, category_name: str):
     print(f"\n[네이버 크롤링] {category_name} 수집 시작... ({issue_url})")
     
-    # 모바일 주소 변환 (크롤링이 훨씬 잘 됨)
+    # 모바일 주소 변환
     m_url = issue_url.replace("media.naver.com", "m.news.naver.com")
     res = requests.get(m_url, headers=HEADERS)
     soup = BeautifulSoup(res.text, "html.parser")
     
-    # 기사 링크 추출
     links = soup.find_all("a")
     valid_links = []
     
@@ -97,7 +94,7 @@ def fetch_naver_issue_articles(issue_url: str, category_name: str):
                 href = "https://n.news.naver.com" + href if href.startswith("/") else "https://n.news.naver.com/" + href
             valid_links.append((title, href))
 
-    print(f"🔎 발견된 기사 후보 수: {len(valid_links)}개")
+    print(f"🔎 발견된 기사 후보: {len(valid_links)}개")
     
     collected_count = 0
     saved_urls = set()
